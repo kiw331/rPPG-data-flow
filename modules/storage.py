@@ -61,7 +61,8 @@ def raw_writer_worker(q, save_dir):
     print(f"\n💾 [Writer] .raw 저장 완료. 총 {frame_idx} 프레임.")
 
 def save_camera_settings(camera, program_version, actual_duration, parent_dir):
-    """카메라 설정을 요약 및 전체 형태로 JSON / TXT 포맷으로 저장"""
+    """카메라 설정을 요약(JSON) 및 전체 형태(TXT)의 별개 파일로 분리 저장"""
+    summary_path = os.path.join(parent_dir, "camera_summary.json")
     settings_path = os.path.join(parent_dir, "camera_all_settings.txt")
     temp_pfs_path = os.path.join(parent_dir, "temp_settings.pfs")
     
@@ -94,13 +95,13 @@ def save_camera_settings(camera, program_version, actual_duration, parent_dir):
             "Color_Temp": get_val("LightSourcePreset")
         }
         
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=4, ensure_ascii=False)
+            
         with open(settings_path, 'w', encoding='utf-8') as f:
-            f.write("=== [Summary] Main Camera Settings ===\n")
-            f.write(json.dumps(summary, indent=4, ensure_ascii=False))
-            f.write("\n\n\n=== [Full Dump] Camera All Settings ===\n")
             f.write(full_dump)
             
-        print(f"💾 [Camera] 요약 + 전체 설정 저장 완료 (실제 소요시간: {actual_duration}초)")
+        print(f"💾 [Camera] 요약 JSON({os.path.basename(summary_path)}) 및 전체 설정 TXT 저장 완료 (실제 소요시간: {actual_duration}초)")
         
     except Exception as e:
         print(f"❌ 설정 파일 저장 실패: {e}")

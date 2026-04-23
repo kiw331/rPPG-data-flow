@@ -97,6 +97,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("rPPG_Qt_CameraOnly (Dual ROI Monitoring)")
         self.resize(1350, 720) 
         
+        self.load_roi_settings()
+
         self.recording_duration = 60 
         self.remaining_time = 0
         self.current_save_dir = "" 
@@ -211,16 +213,16 @@ class MainWindow(QMainWindow):
         
         roi1_layout = QHBoxLayout()
         roi1_layout.addWidget(QLabel("🟥 ROI 1:"))
-        self.spin_roi1_x = QSpinBox(); self.spin_roi1_x.setRange(0, 4000); self.spin_roi1_x.setValue(472) # X 통일
-        self.spin_roi1_y = QSpinBox(); self.spin_roi1_y.setRange(0, 4000); self.spin_roi1_y.setValue(350) # 위쪽
-        self.spin_roi1_l = QSpinBox(); self.spin_roi1_l.setRange(2, 1000); self.spin_roi1_l.setValue(80)
+        self.spin_roi1_x = QSpinBox(); self.spin_roi1_x.setRange(0, 4000); self.spin_roi1_x.setValue(self.roi1_x) 
+        self.spin_roi1_y = QSpinBox(); self.spin_roi1_y.setRange(0, 4000); self.spin_roi1_y.setValue(self.roi1_y) 
+        self.spin_roi1_l = QSpinBox(); self.spin_roi1_l.setRange(2, 1000); self.spin_roi1_l.setValue(self.roi1_l)
         roi1_layout.addWidget(self.spin_roi1_x); roi1_layout.addWidget(self.spin_roi1_y); roi1_layout.addWidget(self.spin_roi1_l)
         
         roi2_layout = QHBoxLayout()
         roi2_layout.addWidget(QLabel("🟩 ROI 2:"))
-        self.spin_roi2_x = QSpinBox(); self.spin_roi2_x.setRange(0, 4000); self.spin_roi2_x.setValue(472) # X 통일
-        self.spin_roi2_y = QSpinBox(); self.spin_roi2_y.setRange(0, 4000); self.spin_roi2_y.setValue(450) # 아래쪽
-        self.spin_roi2_l = QSpinBox(); self.spin_roi2_l.setRange(2, 1000); self.spin_roi2_l.setValue(80)
+        self.spin_roi2_x = QSpinBox(); self.spin_roi2_x.setRange(0, 4000); self.spin_roi2_x.setValue(self.roi2_x) 
+        self.spin_roi2_y = QSpinBox(); self.spin_roi2_y.setRange(0, 4000); self.spin_roi2_y.setValue(self.roi2_y) 
+        self.spin_roi2_l = QSpinBox(); self.spin_roi2_l.setRange(2, 1000); self.spin_roi2_l.setValue(self.roi2_l)
         roi2_layout.addWidget(self.spin_roi2_x); roi2_layout.addWidget(self.spin_roi2_y); roi2_layout.addWidget(self.spin_roi2_l)
 
         area_layout.addLayout(roi1_layout)
@@ -234,6 +236,7 @@ class MainWindow(QMainWindow):
         self.spin_roi2_x.valueChanged.connect(self.update_areas)
         self.spin_roi2_y.valueChanged.connect(self.update_areas)
         self.spin_roi2_l.valueChanged.connect(self.update_areas)
+        self.update_areas() # ROI 초기 설정 동기화
 
         rec_group = QGroupBox("Recording Controls")
         rec_layout = QVBoxLayout()
@@ -469,11 +472,98 @@ class MainWindow(QMainWindow):
         if (q is not None and q.empty()) or (not self.video_thread.writer_thread.is_alive()):
             self.save_check_timer.stop()
             print("\n✅ 저장 완료.")
+            self.validate_recording()
             self.video_thread.is_running = False
             self.video_thread.wait(1000)
             QApplication.quit() 
 
+    def validate_recording(self):
+        try:
+            summary_path = os.path.join(self.current_save_dir, "camera_summary.json")
+            if not os.path.exists(summary_path): return
+            
+            with open(summary_path, 'r', encoding='utf-8') as f:
+                summary = json.load(f)
+            
+            duration = summary.get("Record_Duration_sec", 0)
+            target_fps = summary.get("FPS_Target", 60)
+            if duration <= 0: return
+            
+            expected_frames = int(duration * target_fps)
+            csv_path = os.path.join(self.video_thread.save_dir, "camera_timestamps.csv")
+            actual_frames = 0
+            if os.path.exists(csv_path):
+                with open(csv_path, 'r', encoding='utf-8') as f:
+                    actual_frames = max(0, sum(1 for _ in f) - 1)
+            
+            cam_diff = abs(actual_frames - expected_frames) / max(1, expected_frames)
+            msg_lines = [f"▶ 예상 카메라 프레임: {expected_frames} | 실제 저장: {actual_frames} (차이: {cam_diff*100:.1f}%)"]
+            
+            warning_triggered = False
+            if cam_diff >= 0.02:
+                warning_triggered = True
+                msg_lines.append("  ⚠️ [경고] 카메라 데이터 기록 수가 기대값과 2% 이상 차이가 납니다.")
+                
+            if hasattr(self, 'sensor_thread'):
+                expected_sensor = int(duration * 200)
+                sensor_csv = os.path.join(self.current_save_dir, "ppg_sensor.csv")
+                actual_sensor = 0
+                if os.path.exists(sensor_csv):
+                    with open(sensor_csv, 'r', encoding='utf-8') as f:
+                        actual_sensor = max(0, sum(1 for _ in f) - 1)
+                
+                sen_diff = abs(actual_sensor - expected_sensor) / max(1, expected_sensor)
+                msg_lines.append(f"▶ 예상 센서 데이터 수: {expected_sensor} | 실제 저장: {actual_sensor} (차이: {sen_diff*100:.1f}%)")
+                if sen_diff >= 0.02:
+                    warning_triggered = True
+                    msg_lines.append("  ⚠️ [경고] 센서 데이터 기록 수가 기대값과 2% 이상 차이가 납니다.")
+                    
+            print("\n=== 데이터 저장 결과 검증 ===")
+            print("\n".join(msg_lines))
+            print("===========================\n")
+            
+            if warning_triggered:
+                QMessageBox.warning(self, "저장 데이터 검증 경고", "\n".join(msg_lines))
+                
+        except Exception as e:
+            print(f"검증 중 오류 발생: {e}") 
+
+    def load_roi_settings(self):
+        self.roi1_x, self.roi1_y, self.roi1_l = 472, 350, 80
+        self.roi2_x, self.roi2_y, self.roi2_l = 472, 450, 80
+        setting_path = os.path.join("setting", "roi_CameraOnly.json")
+        if os.path.exists(setting_path):
+            try:
+                with open(setting_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.roi1_x = data.get("roi1_x", 472)
+                    self.roi1_y = data.get("roi1_y", 350)
+                    self.roi1_l = data.get("roi1_l", 80)
+                    self.roi2_x = data.get("roi2_x", 472)
+                    self.roi2_y = data.get("roi2_y", 450)
+                    self.roi2_l = data.get("roi2_l", 80)
+            except Exception as e:
+                print(f"Failed to load ROI settings: {e}")
+
+    def save_roi_settings(self):
+        os.makedirs("setting", exist_ok=True)
+        setting_path = os.path.join("setting", "roi_CameraOnly.json")
+        data = {
+            "roi1_x": self.spin_roi1_x.value(),
+            "roi1_y": self.spin_roi1_y.value(),
+            "roi1_l": self.spin_roi1_l.value(),
+            "roi2_x": self.spin_roi2_x.value(),
+            "roi2_y": self.spin_roi2_y.value(),
+            "roi2_l": self.spin_roi2_l.value()
+        }
+        try:
+            with open(setting_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            print(f"Failed to save ROI settings: {e}")
+
     def closeEvent(self, event):
+        self.save_roi_settings()
         self.video_thread.is_running = False
         self.video_thread.wait()
         event.accept()
