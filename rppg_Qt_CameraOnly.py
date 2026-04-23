@@ -32,251 +32,63 @@ import pyqtgraph as pg
 BASE_OUTPUT_DIR = r"data\basler_0225"  # 동적 폴더 생성에 활용될 기본 경로
 # ===============================================
 
-# 💾 [저장 스레드]
-def writer_worker(q, save_dir):
-    parent_dir = os.path.dirname(save_dir)
-    csv_path = os.path.join(parent_dir, "camera_timestamps.csv")
-    f_csv = open(csv_path, 'w', newline='')
-    writer = csv.writer(f_csv)
-    writer.writerow(["Frame_Index", "Timestamp"])
-    frame_idx = 0
-    while True:
-        item = q.get()
-        if item is None:
-            q.task_done()
-            break
-        raw_data, timestamp = item
-        file_name = f"frame_{frame_idx:04d}.tiff"
-        tifffile.imwrite(os.path.join(save_dir, file_name), raw_data)
-        writer.writerow([frame_idx, timestamp])
-        frame_idx += 1
-        q.task_done()
-    f_csv.close()
-    print("\n💾 [Writer] 이미지 저장 완료.")
+from modules.storage import writer_worker
+from modules.camera import BaseCameraThread
 
 # 📷 [카메라 스레드]
-class CameraThread(QThread):
-    change_pixmap_signal = pyqtSignal(np.ndarray) 
-    queue_status_signal = pyqtSignal(int)
-    recording_finished_signal = pyqtSignal(str) 
-    initial_settings_signal = pyqtSignal(dict)
-    
+class CameraThread(BaseCameraThread):
     def __init__(self, gui_q):
-            super().__init__()
-            self.is_running = True
-            self.is_recording = False
-            self.img_queue = None 
-            self.writer_thread = None
-            self.save_dir = "" 
-            self.camera = None
-            self.gui_q = gui_q
-            self.cmd_queue = queue.Queue()
-            
-            # 💡 [수정] ROI 1은 위쪽(Y=350), ROI 2는 아래쪽(Y=450)으로 배치 (크기 80 기준, 20픽셀 간격)
-            self.roi1_config = (472, 350, 80)
-            self.roi2_config = (472, 450, 80)
-            self.current_format = "BayerRG12" 
-            self.rec_start_time = 0
-            
+        super().__init__(gui_q=gui_q, user_set="UserSet1", program_version="CameraOnly")
+        # 💡 [수정] ROI 1은 위쪽(Y=350), ROI 2는 아래쪽(Y=450)으로 배치 (크기 80 기준, 20픽셀 간격)
+        self.roi1_config = (472, 350, 80)
+        self.roi2_config = (472, 450, 80)
         
-    def run(self):
-        try:
-            tl_factory = pylon.TlFactory.GetInstance()
-            self.camera = pylon.InstantCamera(tl_factory.CreateFirstDevice())
-            self.camera.Open()
+    def process_frame(self, raw_data, capture_time):
+        h, w = raw_data.shape[:2]
+        
+        # 💡 [변경] 두 ROI 영역 안전성 연산 및 추출
+        r1x, r1y, r1l = self.roi1_config
+        r2x, r2y, r2l = self.roi2_config
+        
+        r1x, r1y, r1l = r1x & ~1, r1y & ~1, max(2, r1l & ~1)
+        r2x, r2y, r2l = r2x & ~1, r2y & ~1, max(2, r2l & ~1)
+        
+        r1x, r1y = max(0, min(w - r1l, r1x)), max(0, min(h - r1l, r1y))
+        r2x, r2y = max(0, min(w - r2l, r2x)), max(0, min(h - r2l, r2y))
+        
+        roi1_raw = raw_data[r1y:r1y+r1l, r1x:r1x+r1l]
+        roi2_raw = raw_data[r2y:r2y+r2l, r2x:r2x+r2l]
+        
+        import cv2
+        if self.current_format == "BGR8":
+            roi1_rgb = cv2.cvtColor(roi1_raw, cv2.COLOR_BGR2RGB)
+            roi2_rgb = cv2.cvtColor(roi2_raw, cv2.COLOR_BGR2RGB)
+        else:
+            roi1_rgb = cv2.cvtColor(roi1_raw, cv2.COLOR_BayerBG2RGB)
+            roi2_rgb = cv2.cvtColor(roi2_raw, cv2.COLOR_BayerBG2RGB)
+        
+        roi1_mean = cv2.mean(roi1_rgb)[:3]
+        roi2_mean = cv2.mean(roi2_rgb)[:3]
+        
+        self.gui_q.append((capture_time, roi1_mean, roi2_mean))
+        
+        if not self.is_recording or self.frame_count % 2 == 0: 
+            view_8bit = self.render_base_pixmap(raw_data)
             
-            self.camera.UserSetSelector.SetValue("UserSet1")
-            self.camera.UserSetLoad.Execute()
-            self.camera.MaxNumBuffer.SetValue(20)
+            r1x_h, r1y_h, r1l_h = r1x // 2, r1y // 2, r1l // 2
+            r2x_h, r2y_h, r2l_h = r2x // 2, r2y // 2, r2l // 2
             
-            init_settings = {}
-            try: init_settings['format'] = self.camera.PixelFormat.GetValue()
-            except Exception: pass
-            try: init_settings['fps'] = self.camera.AcquisitionFrameRate.GetValue()
-            except Exception: pass
-            try: init_settings['exp'] = self.camera.ExposureTime.GetValue()
-            except Exception: pass
-            try: init_settings['color'] = self.camera.LightSourcePreset.GetValue()
-            except Exception: pass
+            # ROI 1 = 빨간색, ROI 2 = 초록색 박스
+            cv2.rectangle(view_8bit, (r1x_h, r1y_h), (r1x_h+r1l_h, r1y_h+r1l_h), (255, 0, 0), 2)
+            cv2.rectangle(view_8bit, (r2x_h, r2y_h), (r2x_h+r2l_h, r2y_h+r2l_h), (0, 255, 0), 2)
             
-            self.current_format = init_settings.get('format', "BayerRG12")
-            self.initial_settings_signal.emit(init_settings)
-            
-            self.camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
-            frame_count = 0
-            
-            while self.is_running:
-                while not self.cmd_queue.empty():
-                    cmd = self.cmd_queue.get_nowait()
-                    try:
-                        was_grabbing = self.camera.IsGrabbing()
-                        if was_grabbing:
-                            self.camera.StopGrabbing()
-                            
-                        if 'resolution' in cmd and cmd['resolution'] is not None:
-                            res = cmd['resolution']
-                            try:
-                                self.camera.OffsetX.SetValue(0)
-                                self.camera.OffsetY.SetValue(0)
-                                self.camera.Width.SetValue(res['w'])
-                                self.camera.Height.SetValue(res['h'])
-                                self.camera.OffsetX.SetValue(res['ox'])
-                                self.camera.OffsetY.SetValue(res['oy'])
-                            except Exception as e:
-                                print(f"❌ 해상도/오프셋 변경 실패: {e}")
+            self.change_pixmap_signal.emit(view_8bit)
 
-                        if 'fps' in cmd:
-                            self.camera.AcquisitionFrameRateEnable.SetValue(True)
-                            self.camera.AcquisitionFrameRate.SetValue(float(cmd['fps']))
-                        if 'exp' in cmd:
-                            self.camera.ExposureTime.SetValue(float(cmd['exp']))
-                        if 'color' in cmd:
-                            self.camera.LightSourcePreset.SetValue(cmd['color'])
-                        if 'format' in cmd:
-                            self.camera.PixelFormat.SetValue(cmd['format'])
-                            self.current_format = cmd['format']
-                            
-                        if was_grabbing:
-                            self.camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
-                            
-                        print(f"✅ 카메라 세팅 덮어쓰기 완료")
-                    except Exception as e:
-                        print(f"❌ 카메라 세팅 변경 실패: {e}")
-                        if not self.camera.IsGrabbing():
-                            self.camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
-
-                if not self.camera.IsGrabbing():
-                    time.sleep(0.01)
-                    continue
-
-                grabResult = self.camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
-                if grabResult.GrabSucceeded():
-                    capture_time = time.time()
-                    raw_data = grabResult.GetArray()
-                    
-                    if self.is_recording:
-                        if not self.img_queue.full():
-                            self.img_queue.put((raw_data.copy(), capture_time))
-                        frame_count += 1
-                        if frame_count % 30 == 0: 
-                            self.queue_status_signal.emit(self.img_queue.qsize())
-                            
-                    h, w = raw_data.shape[:2]
-                    
-                    # 💡 [변경] 두 ROI 영역 안전성 연산 및 추출
-                    r1x, r1y, r1l = self.roi1_config
-                    r2x, r2y, r2l = self.roi2_config
-                    
-                    r1x, r1y, r1l = r1x & ~1, r1y & ~1, max(2, r1l & ~1)
-                    r2x, r2y, r2l = r2x & ~1, r2y & ~1, max(2, r2l & ~1)
-                    
-                    r1x, r1y = max(0, min(w - r1l, r1x)), max(0, min(h - r1l, r1y))
-                    r2x, r2y = max(0, min(w - r2l, r2x)), max(0, min(h - r2l, r2y))
-                    
-                    roi1_raw = raw_data[r1y:r1y+r1l, r1x:r1x+r1l]
-                    roi2_raw = raw_data[r2y:r2y+r2l, r2x:r2x+r2l]
-                    
-                    if self.current_format == "BGR8":
-                        roi1_rgb = cv2.cvtColor(roi1_raw, cv2.COLOR_BGR2RGB)
-                        roi2_rgb = cv2.cvtColor(roi2_raw, cv2.COLOR_BGR2RGB)
-                    else:
-                        roi1_rgb = cv2.cvtColor(roi1_raw, cv2.COLOR_BayerBG2RGB)
-                        roi2_rgb = cv2.cvtColor(roi2_raw, cv2.COLOR_BayerBG2RGB)
-                    
-                    roi1_mean = cv2.mean(roi1_rgb)[:3]
-                    roi2_mean = cv2.mean(roi2_rgb)[:3]
-                    
-                    self.gui_q.append((capture_time, roi1_mean, roi2_mean))
-                    
-                    if not self.is_recording or frame_count % 2 == 0: 
-                        if self.current_format == "BGR8":
-                            view_rgb = cv2.cvtColor(raw_data, cv2.COLOR_BGR2RGB)
-                            view_rgb = cv2.resize(view_rgb, (0, 0), fx=0.5, fy=0.5) 
-                            view_8bit = view_rgb
-                        else:
-                            view_rgb = cv2.cvtColor(raw_data, cv2.COLOR_BayerBG2RGB)
-                            view_rgb = cv2.resize(view_rgb, (0, 0), fx=0.5, fy=0.5) 
-                            if self.current_format == "BayerRG12":
-                                view_8bit = (view_rgb >> 4).astype(np.uint8)
-                            else:
-                                view_8bit = view_rgb.astype(np.uint8)
-                        
-                        r1x_h, r1y_h, r1l_h = r1x // 2, r1y // 2, r1l // 2
-                        r2x_h, r2y_h, r2l_h = r2x // 2, r2y // 2, r2l // 2
-                        
-                        # ROI 1 = 빨간색, ROI 2 = 초록색 박스
-                        cv2.rectangle(view_8bit, (r1x_h, r1y_h), (r1x_h+r1l_h, r1y_h+r1l_h), (255, 0, 0), 2)
-                        cv2.rectangle(view_8bit, (r2x_h, r2y_h), (r2x_h+r2l_h, r2y_h+r2l_h), (0, 255, 0), 2)
-                        
-                        self.change_pixmap_signal.emit(view_8bit)
-                        
-                grabResult.Release()
-            self.camera.StopGrabbing(); self.camera.Close()
-        except Exception as e:
-            print(f"❌ [Camera] 오류: {e}")
-            
     def start_recording(self, save_dir):
-        gc.collect()
-        self.save_dir = save_dir
-        self.img_queue = queue.Queue(maxsize=3000)
-        self.writer_thread = threading.Thread(target=writer_worker, args=(self.img_queue, self.save_dir), daemon=True)
-        self.writer_thread.start()
-        self.is_recording = True
-        self.rec_start_time = time.time()
+        self.start_recording_with_worker(save_dir, writer_worker)
         
     def stop_recording(self):
-        self.is_recording = False
-        if self.img_queue: self.img_queue.put(None) 
-        
-        actual_duration = 0
-        if hasattr(self, 'rec_start_time') and self.rec_start_time > 0:
-            actual_duration = round(time.time() - self.rec_start_time, 2)
-            
-        if self.save_dir and self.camera is not None:
-            parent_dir = os.path.dirname(self.save_dir)
-            settings_path = os.path.join(parent_dir, "camera_all_settings.txt")
-            temp_pfs_path = os.path.join(parent_dir, "temp_settings.pfs")
-            
-            try:
-                pylon.FeaturePersistence.Save(temp_pfs_path, self.camera.GetNodeMap())
-                with open(temp_pfs_path, 'r', encoding='utf-8') as f:
-                    full_dump = f.read()
-                os.remove(temp_pfs_path) 
-                
-                def get_val(node):
-                    try: return getattr(self.camera, node).GetValue()
-                    except: return None
-                
-                fps_result = get_val("ResultingFrameRate")
-                if fps_result is not None: fps_result = round(fps_result, 2)
-                
-                summary = {
-                    "Program_Version": "CameraOnly",  # 💡 버전 명시
-                    "Record_Duration_sec": actual_duration,
-                    "Resolution": {
-                        "Width": get_val("Width"),
-                        "Height": get_val("Height"),
-                        "OffsetX": get_val("OffsetX"),
-                        "OffsetY": get_val("OffsetY")
-                    },
-                    "PixelFormat": get_val("PixelFormat"),
-                    "FPS_Target": get_val("AcquisitionFrameRate"),
-                    "FPS_Result": fps_result,
-                    "Exposure_us": get_val("ExposureTime"),
-                    "Color_Temp": get_val("LightSourcePreset")
-                }
-                
-                with open(settings_path, 'w', encoding='utf-8') as f:
-                    f.write("=== [Summary] Main Camera Settings ===\n")
-                    f.write(json.dumps(summary, indent=4, ensure_ascii=False))
-                    f.write("\n\n\n=== [Full Dump] Camera All Settings ===\n")
-                    f.write(full_dump)
-                    
-                print(f"💾 [Camera] 요약 + 전체 설정 저장 완료 (소요시간: {actual_duration}초)")
-            except Exception as e:
-                print(f"❌ 설정 파일 저장 실패: {e}")
-                
-        self.recording_finished_signal.emit(self.save_dir)
+        self.stop_recording_and_save_settings()
 
 # [UI 클래스] 
 class MainWindow(QMainWindow):
