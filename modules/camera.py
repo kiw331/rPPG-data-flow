@@ -136,10 +136,11 @@ class BaseCameraThread(QThread):
             view_rgb = cv2.resize(view_rgb, (0, 0), fx=0.5, fy=0.5) 
             view_8bit = view_rgb
         else:
-            view_rgb = cv2.cvtColor(raw_data, cv2.COLOR_BayerBG2RGB)
+            # BayerRG12: QImage.Format_RGB888로 전달하므로 RGB 출력
+            view_rgb = cv2.cvtColor(raw_data, cv2.COLOR_BayerRG2RGB)
             view_rgb = cv2.resize(view_rgb, (0, 0), fx=0.5, fy=0.5) 
-            if self.current_format == "BayerRG12":
-                view_8bit = (view_rgb >> 4).astype(np.uint8)
+            if self.current_format in ("BayerRG12", "BayerRG8"):
+                view_8bit = (view_rgb >> 4).astype(np.uint8)  # 12bit → 8bit
             else:
                 view_8bit = view_rgb.astype(np.uint8)
         return view_8bit
