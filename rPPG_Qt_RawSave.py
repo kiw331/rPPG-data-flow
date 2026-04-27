@@ -457,7 +457,7 @@ class MainWindow(QMainWindow):
             self.validate_recording()
             self.video_thread.is_running = False
             self.video_thread.wait(1000)
-            QApplication.quit() 
+            self.close()
 
     def validate_recording(self):
         try:
