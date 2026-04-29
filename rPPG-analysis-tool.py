@@ -303,53 +303,30 @@ class GraphPopup(QDialog):
         low_cut = bpm_min / 60.0
         high_cut = bpm_max / 60.0
 
-        plot_colors = [(255,0,0), (0,255,0), (0,0,255)]
+        color_roi = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+        color_bg  = (200, 0, 200)
+        color_ppg = (200, 200, 200)
 
         self.graph_layout.clear()
-        
-        if len(t_cam_plot) > 0:
-            self.max_time = t_cam_plot[-1]
-        else:
-            self.max_time = 1.0
+
+        self.max_time = t_cam_plot[-1] if len(t_cam_plot) > 0 else 1.0
 
         active_plots = []
 
+        # ── 1. ROI Raw (체크된 것만) ──────────────────────────────────
         for i in range(roi_count):
             if i < 3 and self.chks[i].isChecked():
                 p = self.plots[i]
                 p.clear()
                 self.graph_layout.addItem(p)
                 self.graph_layout.nextRow()
-                y_raw = raw_rgb[i, :, ch_idx]
-                p.plot(t_cam_plot, y_raw, pen=pg.mkPen(plot_colors[i], width=2))
+                p.plot(t_cam_plot, raw_rgb[i, :, ch_idx],
+                       pen=pg.mkPen(color_roi[i], width=2))
                 p.setTitle(f"ROI {i+1} Raw [{ch_name}]")
                 p.enableAutoRange(axis=pg.ViewBox.YAxis)
                 active_plots.append(p)
 
-        if self.chk_filt.isChecked():
-            p_filt = self.plots[3]
-            p_filt.clear()
-            self.graph_layout.addItem(p_filt)
-            self.graph_layout.nextRow()
-            p_filt.setTitle(f"Filtered Signals [{ch_name}]")
-            p_filt.addLegend()
-            for i in range(roi_count):
-                y_raw = raw_rgb[i, :, ch_idx]
-                y_c = y_raw - np.mean(y_raw)
-                try:
-                    y_filt = self.butter_bandpass_filter(y_c, low_cut, high_cut, fs_cam)
-                    min_dist = 60.0 / bpm_max
-                    peaks, _ = find_peaks(y_filt, distance=int(min_dist * fs_cam), prominence=np.std(y_filt)*0.5)
-                    bpm = 60.0 / np.mean(np.diff(t_cam[peaks])) if len(peaks) > 1 else 0
-                    p_filt.plot(t_cam_plot, y_filt, pen=pg.mkPen(plot_colors[i], width=2), name=f"ROI {i+1} (BPM: {bpm:.1f})")
-                    if len(peaks) > 0:
-                        scatter = pg.ScatterPlotItem(x=t_cam_plot[peaks], y=y_filt[peaks], pen=None, brush=pg.mkBrush(plot_colors[i]), size=8, symbol='x')
-                        p_filt.addItem(scatter)
-                except:
-                    pass
-            p_filt.enableAutoRange(axis=pg.ViewBox.YAxis)
-            active_plots.append(p_filt)
-
+        # ── 2. PPG Raw (체크된 경우) ──────────────────────────────────
         if has_sensor and self.chk_ppg.isChecked():
             p_ppg = self.plots[4]
             p_ppg.clear()
@@ -358,27 +335,86 @@ class GraphPopup(QDialog):
             t_sensor = res['t_sensor']
             y_sensor = res['y_sensor']
             t_sensor_plot = t_sensor - t_cam[0] if len(t_sensor) > 0 else t_sensor
-            p_ppg.plot(t_sensor_plot, y_sensor, pen=pg.mkPen(200,200,200, width=2))
+            p_ppg.plot(t_sensor_plot, y_sensor,
+                       pen=pg.mkPen(color_ppg, width=2))
             p_ppg.setTitle("PPG Raw Sensor Data")
             p_ppg.enableAutoRange(axis=pg.ViewBox.YAxis)
             active_plots.append(p_ppg)
 
+        # ── 3. Background Raw (체크된 경우) ──────────────────────────
         if has_bg and self.chk_bg.isChecked():
             p_bg = self.plots[5]
             p_bg.clear()
             self.graph_layout.addItem(p_bg)
             self.graph_layout.nextRow()
-            y_bg_raw = raw_rgb[roi_count, :, ch_idx]
-            p_bg.plot(t_cam_plot, y_bg_raw, pen=pg.mkPen((200,0,200), width=2))
+            p_bg.plot(t_cam_plot, raw_rgb[roi_count, :, ch_idx],
+                      pen=pg.mkPen(color_bg, width=2))
             p_bg.setTitle(f"Background Raw [{ch_name}]")
             p_bg.enableAutoRange(axis=pg.ViewBox.YAxis)
             active_plots.append(p_bg)
 
+        # ── 4. Filtered All Signals (맨 아래, 체크된 신호 전부) ──────
+        if self.chk_filt.isChecked():
+            p_filt = self.plots[3]
+            p_filt.clear()
+            self.graph_layout.addItem(p_filt)
+            self.graph_layout.nextRow()
+            p_filt.setTitle(f"Filtered Signals [{ch_name}]  (z-score normalized)")
+            p_filt.addLegend()
+
+            def _plot_filtered(x_plot, y_raw, fs, color, label):
+                """신호 평균 제거 → 밴드패스 → std 정규화 → 피크 검출 후 플롯.
+                모든 신호를 동일 스케일(단위: std)로 정규화하여 진폭 비교 가능."""
+                y_c = y_raw - np.mean(y_raw)
+                try:
+                    y_f = self.butter_bandpass_filter(y_c, low_cut, high_cut, fs)
+                    # std 정규화: 모든 신호를 동일 진폭 스케일로
+                    sigma = np.std(y_f)
+                    y_norm = y_f / sigma if sigma > 0 else y_f
+                    min_d = int(60.0 / bpm_max * fs)
+                    peaks, _ = find_peaks(y_norm, distance=max(1, min_d),
+                                          prominence=0.5)  # 정규화 후 고정 prominence
+                    bpm = (60.0 / np.mean(np.diff(x_plot[peaks]))
+                           if len(peaks) > 1 else 0)
+                    p_filt.plot(x_plot, y_norm,
+                                pen=pg.mkPen(color, width=2),
+                                name=f"{label} (BPM: {bpm:.1f})")
+                    if len(peaks) > 0:
+                        sc = pg.ScatterPlotItem(
+                            x=x_plot[peaks], y=y_norm[peaks],
+                            pen=None, brush=pg.mkBrush(color), size=8, symbol='x')
+                        p_filt.addItem(sc)
+                except Exception:
+                    pass
+
+            # ROI 신호 (체크된 것만)
+            for i in range(roi_count):
+                if i < 3 and not self.chks[i].isChecked():
+                    continue
+                _plot_filtered(t_cam_plot, raw_rgb[i, :, ch_idx],
+                               fs_cam, color_roi[i], f"ROI {i+1}")
+
+            # 배경 신호 (체크된 경우)
+            if has_bg and self.chk_bg.isChecked():
+                _plot_filtered(t_cam_plot, raw_rgb[roi_count, :, ch_idx],
+                               fs_cam, color_bg, "Background")
+
+            # PPG 센서 신호 (체크된 경우, 센서 자체 샘플링 주파수 사용)
+            if has_sensor and self.chk_ppg.isChecked():
+                t_sensor = res['t_sensor']
+                y_sensor = res['y_sensor']
+                t_sensor_plot = t_sensor - t_cam[0] if len(t_sensor) > 0 else t_sensor
+                fs_sensor = (1.0 / np.mean(np.diff(t_sensor))
+                             if len(t_sensor) > 1 else fs_cam)
+                _plot_filtered(t_sensor_plot, y_sensor,
+                               fs_sensor, color_ppg, "PPG Sensor")
+
+            p_filt.enableAutoRange(axis=pg.ViewBox.YAxis)
+            active_plots.append(p_filt)
+
+        # X축 링크
         for i, p in enumerate(active_plots):
-            if i > 0:
-                p.setXLink(active_plots[0])
-            else:
-                p.setXLink(None)
+            p.setXLink(active_plots[0] if i > 0 else None)
 
         self.scrollbar_pan.blockSignals(True)
         self.slider_zoom.blockSignals(True)
@@ -623,38 +659,38 @@ class HistPopup(QDialog):
                 return
 
         img = tifffile.imread(f_path) if f_path.lower().endswith(('.tiff', '.tif')) else cv2.imread(f_path, cv2.IMREAD_UNCHANGED)
-        
-        # pyqtgraph ImageView는 BGR 순서를 기대하므로 BayerRG2BGR 사용
-        if len(img.shape) == 2:
-            img_display = cv2.cvtColor(img, cv2.COLOR_BayerRG2BGR)
-        else:
-            img_display = img  # BGR8 저장 파일은 이미 BGR
 
-        # 히스토그램 계산용 RGB 별도 보관
+        # pyqtgraph는 BGR 해석 (Fix Log: 코드 48 = BayerRG2BGR)
+        # BGR8만 tifffile이 RGB로 태깅하여 읽을 때 채널이 뒤집히므로 변환 필요
         if len(img.shape) == 2:
-            self.current_img_rgb = cv2.cvtColor(img, cv2.COLOR_BayerRG2RGB)
+            img_display = cv2.cvtColor(img, cv2.COLOR_BayerRG2BGR)  # 코드 48
         else:
-            self.current_img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img_display = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # BGR8 전용
+
+        # 히스토그램 계산용 RGB (img_display와 동일)
+        self.current_img_rgb = img_display
 
         img_pg = np.transpose(img_display, (1, 0, 2))
-        self.image_view.setImage(img_pg, autoRange=False)
+        # autoLevels=False: 매 프레임 자동 정규화 비활성화 → 플리커 방지
+        levels = (0, 255) if img_display.dtype == np.uint8 else (0, 4095)
+        self.image_view.setImage(img_pg, autoRange=False, autoLevels=False, levels=levels)
 
         if not hasattr(self, 'x_range_initialized'):
             self.spin_x_min.blockSignals(True)
             self.spin_x_max.blockSignals(True)
-            
+
             self.spin_x_min.setValue(0)
-            if img_rgb.dtype == np.uint8:
+            if self.current_img_rgb.dtype == np.uint8:
                 self.spin_x_max.setValue(256)
             else:
-                img_max = img_rgb.max()
+                img_max = self.current_img_rgb.max()
                 if img_max <= 4096:
                     self.spin_x_max.setValue(4096)
                 elif img_max <= 16384:
                     self.spin_x_max.setValue(16384)
                 else:
                     self.spin_x_max.setValue(65536)
-                    
+
             self.spin_x_min.blockSignals(False)
             self.spin_x_max.blockSignals(False)
             self.x_range_initialized = True
@@ -730,7 +766,8 @@ class MainWindow(QMainWindow):
         self.saved_roi_states = []
         self.saved_bg_state = None
         
-        self.analysis_result = None # Worker에서 받은 결과 저장
+        self.analysis_result = None  # Worker에서 받은 결과 저장
+        self.graph_popup = None       # 상세 그래프 팝업 인스턴스
 
         self.play_timer = QTimer()
         self.play_timer.timeout.connect(self.play_next_frame)
@@ -1137,22 +1174,17 @@ class MainWindow(QMainWindow):
                 return
 
         img = tifffile.imread(f_path) if f_path.lower().endswith(('.tiff', '.tif')) else cv2.imread(f_path, cv2.IMREAD_UNCHANGED)
-        
-        # pyqtgraph ImageView는 BGR 순서를 기대하므로 BayerRG2BGR 사용
+
+        # pyqtgraph BGR 해석, Fix Log 코드 48 = BayerRG2BGR
         if len(img.shape) == 2:
             img_display = cv2.cvtColor(img, cv2.COLOR_BayerRG2BGR)
         else:
-            img_display = img  # BGR8 저장 파일은 이미 BGR, 그대로 사용
+            img_display = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # BGR8 테스트로 확인
 
-        # pyqtgraph ImageView expects axes (x, y, color) usually shape (W, H, 3)
         img_pg = np.transpose(img_display, (1, 0, 2))
-        self.image_view.setImage(img_pg, autoRange=False)
-
-        # ROI 히스토그램용 rgb 참조 별도 보관 (histogram은 cv2 RGB 순서 필요)
-        if len(img.shape) == 2:
-            self.current_img_rgb = cv2.cvtColor(img, cv2.COLOR_BayerRG2RGB)
-        else:
-            self.current_img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # autoLevels=False: 매 프레임 자동 정규화 비활성화 → 플리커 방지
+        levels = (0, 255) if img_display.dtype == np.uint8 else (0, 4095)
+        self.image_view.setImage(img_pg, autoRange=False, autoLevels=False, levels=levels)
 
     # -----------------------------------------------------------------
     # ROI 설정
@@ -1305,7 +1337,12 @@ class MainWindow(QMainWindow):
         self.btn_save_csv.setEnabled(True)
         self.btn_graph_popup.setEnabled(True)
         self.lbl_status.setText("분석 완료")
-        
+
+        # 팝업이 열려 있으면 새 결과로 자동 갱신
+        if self.graph_popup is not None and self.graph_popup.isVisible():
+            self.graph_popup.analysis_result = result
+            self.graph_popup.update_graphs()
+
         # 최초 기본 채널(R) 그래프 표시
         self.update_graphs()
 
@@ -1322,14 +1359,23 @@ class MainWindow(QMainWindow):
     def open_graph_popup(self):
         if not self.analysis_result: return
         duration_val = int(self.spin_duration.value())
-        popup = GraphPopup(
-            self, 
-            analysis_result=self.analysis_result, 
-            folder_path=self.folder_path,
-            spin_duration_val=duration_val,
-            start_frame_idx=self.current_frame_idx
-        )
-        popup.exec()
+
+        if self.graph_popup is not None and self.graph_popup.isVisible():
+            # 이미 열린 팝업이 있으면 최신 데이터로 갱신 후 포커스
+            self.graph_popup.analysis_result = self.analysis_result
+            self.graph_popup.update_graphs()
+            self.graph_popup.raise_()
+            self.graph_popup.activateWindow()
+        else:
+            # 새 팝업 생성
+            self.graph_popup = GraphPopup(
+                self,
+                analysis_result=self.analysis_result,
+                folder_path=self.folder_path,
+                spin_duration_val=duration_val,
+                start_frame_idx=self.current_frame_idx
+            )
+            self.graph_popup.exec()
     def butter_bandpass_filter(self, data, lowcut, highcut, fs, order=4):
         nyq = 0.5 * fs
         low = lowcut / nyq
