@@ -83,8 +83,9 @@ class MainWindow(QMainWindow):
         
         self.load_roi_settings()
         self.load_sensor_settings()
-        
-        self.recording_duration = 60 
+        self.active_channel = self.default_graph  # 'IR' 또는 'RED'
+
+        self.recording_duration = 60
         self.remaining_time = 0
         self.current_save_dir = "" 
         self.is_currently_recording = False
@@ -282,17 +283,30 @@ class MainWindow(QMainWindow):
         # =========================================================
         graphs_group = QGroupBox("Real-time Signals (Time-Synced Raw)")
         graphs_layout = QVBoxLayout()
-        
+
+        ch_row = QHBoxLayout()
+        self.btn_ch_ir = QPushButton("IR 전환")
+        self.btn_ch_ir.clicked.connect(lambda: self.set_channel('IR'))
+        self.btn_ch_red = QPushButton("RED 전환")
+        self.btn_ch_red.clicked.connect(lambda: self.set_channel('RED'))
+        self.lbl_channel = QLabel("표시 중: IR")
+        self.lbl_channel.setStyleSheet("font-weight: bold;")
+        ch_row.addWidget(self.btn_ch_ir)
+        ch_row.addWidget(self.btn_ch_red)
+        ch_row.addWidget(self.lbl_channel)
+        ch_row.addStretch()
+        graphs_layout.addLayout(ch_row)
+
         self.plot_sensor = pg.PlotWidget(title="Hardware PPG Sensor (Raw)")
         self.plot_sensor.setBackground('k')
-        self.plot_sensor.setMinimumHeight(150) 
-        self.curve_sensor = self.plot_sensor.plot(pen=pg.mkPen(color='#f43f5e', width=2))
-        
+        self.plot_sensor.setMinimumHeight(150)
+        self.curve_sensor = self.plot_sensor.plot(pen=pg.mkPen(color='#a78bfa', width=2))
+
         self.plot_roi = pg.PlotWidget(title="Camera ROI (Raw)")
         self.plot_roi.setBackground('k')
         self.plot_roi.setMinimumHeight(150)
-        self.curve_roi = self.plot_roi.plot(pen=pg.mkPen(color='#3b82f6', width=2)) 
-        
+        self.curve_roi = self.plot_roi.plot(pen=pg.mkPen(color='#3b82f6', width=2))
+
         graphs_layout.addWidget(self.plot_sensor)
         graphs_layout.addWidget(self.plot_roi)
         graphs_group.setLayout(graphs_layout)
@@ -318,21 +332,35 @@ class MainWindow(QMainWindow):
         self.check_invert = QCheckBox("Invert(-G)")
         bottom_options_layout.addWidget(self.check_invert)
 
-        bottom_options_layout.addWidget(QLabel(" | IR LED:"))
-        self.spin_brightness = QSpinBox()
-        self.spin_brightness.setRange(0, 255)
-        self.spin_brightness.setValue(self.ir_brightness) 
-        bottom_options_layout.addWidget(self.spin_brightness)
-        
-        self.btn_set_brightness = QPushButton("💡 적용")
-        self.btn_set_brightness.clicked.connect(self.set_brightness)
-        bottom_options_layout.addWidget(self.btn_set_brightness)
-
         bottom_options_group.setLayout(bottom_options_layout)
         right_layout.addWidget(bottom_options_group)
-        
+
+        # LED 밝기 제어 (IR / RED)
+        led_group = QGroupBox("LED Brightness")
+        led_layout = QHBoxLayout()
+        led_layout.addWidget(QLabel("IR:"))
+        self.spin_ir_brightness = QSpinBox()
+        self.spin_ir_brightness.setRange(0, 255)
+        self.spin_ir_brightness.setValue(self.ir_brightness)
+        led_layout.addWidget(self.spin_ir_brightness)
+        self.btn_set_ir = QPushButton("💡 IR 적용")
+        self.btn_set_ir.clicked.connect(self.set_ir_brightness)
+        led_layout.addWidget(self.btn_set_ir)
+        led_layout.addWidget(QLabel(" | RED:"))
+        self.spin_red_brightness = QSpinBox()
+        self.spin_red_brightness.setRange(0, 255)
+        self.spin_red_brightness.setValue(self.red_brightness)
+        led_layout.addWidget(self.spin_red_brightness)
+        self.btn_set_red = QPushButton("💡 RED 적용")
+        self.btn_set_red.clicked.connect(self.set_red_brightness)
+        led_layout.addWidget(self.btn_set_red)
+        led_group.setLayout(led_layout)
+        right_layout.addWidget(led_group)
+
         main_layout.addLayout(left_layout, stretch=4)
         main_layout.addLayout(right_layout, stretch=5)
+
+        self.set_channel(self.default_graph)
 
     def sync_ui_with_camera(self, settings):
         self.spin_cam_fps.blockSignals(True)
@@ -428,21 +456,24 @@ class MainWindow(QMainWindow):
     def redraw_graphs(self):
         sen_list = list(self.sensor_q)
         cam_list = list(self.cam_q)
-        
+
         if len(sen_list) > 10 and len(cam_list) > 10:
             latest_t = max(sen_list[-1][0], cam_list[-1][0])
-            
+
             s_idx = max(0, len(sen_list) - self.sensor_x_range)
             c_idx = max(0, len(cam_list) - self.cam_x_range)
+            sen_seg = sen_list[s_idx:]
+            cam_seg = cam_list[c_idx:]
 
-            t_sen = np.array([item[0] - latest_t for item in sen_list[s_idx:]])
-            y_sen = np.array([item[1] for item in sen_list[s_idx:]])
-            
-            t_cam = np.array([item[0] - latest_t for item in cam_list[c_idx:]])
-            
+            sen_col = 1 if self.active_channel == 'IR' else 2
+            t_sen = np.array([item[0] - latest_t for item in sen_seg])
+            y_sen = np.array([item[sen_col] for item in sen_seg])
+
+            t_cam = np.array([item[0] - latest_t for item in cam_seg])
+
             ch_idx = self.combo_channel.currentIndex()
-            y_roi = np.array([item[1][ch_idx] for item in cam_list[c_idx:]])
-            
+            y_roi = np.array([item[1][ch_idx] for item in cam_seg])
+
             if self.check_invert.isChecked():
                 y_roi = -y_roi
 
@@ -451,17 +482,37 @@ class MainWindow(QMainWindow):
 
             self.curve_sensor.setData(x=t_sen, y=y_sen)
             self.curve_roi.setData(x=t_cam, y=y_roi)
-            
+
             self.plot_sensor.setXRange(-self.display_window_sec, 0, padding=0)
             self.plot_roi.setXRange(-self.display_window_sec, 0, padding=0)
+
+    def set_channel(self, channel):
+        if channel not in ('IR', 'RED'):
+            channel = 'IR'
+        self.active_channel = channel
+        if channel == 'IR':
+            self.curve_sensor.setPen(pg.mkPen(color='#a78bfa', width=2))
+            self.lbl_channel.setText("표시 중: IR")
+            self.btn_ch_ir.setStyleSheet("background-color: #a78bfa; color: white; font-weight: bold;")
+            self.btn_ch_red.setStyleSheet("")
+        else:
+            self.curve_sensor.setPen(pg.mkPen(color='#ef4444', width=2))
+            self.lbl_channel.setText("표시 중: RED")
+            self.btn_ch_red.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold;")
+            self.btn_ch_ir.setStyleSheet("")
+        self.curve_sensor.setData(x=[], y=[])
 
     def update_sensor_stats(self, hz, drops):
         self.lbl_hz.setText(f"Sampling Rate: {hz} Hz")
         self.lbl_drop.setText(f"Packet Drops: {drops}")
 
-    def set_brightness(self):
-        val = self.spin_brightness.value()
-        if self.sensor_thread.isRunning(): self.sensor_thread.send_brightness_command(val)
+    def set_ir_brightness(self):
+        val = self.spin_ir_brightness.value()
+        if self.sensor_thread.isRunning(): self.sensor_thread.send_ir_brightness_command(val)
+
+    def set_red_brightness(self):
+        val = self.spin_red_brightness.value()
+        if self.sensor_thread.isRunning(): self.sensor_thread.send_red_brightness_command(val)
 
     def update_image(self, cv_img):
         h, w, ch = cv_img.shape
@@ -593,7 +644,7 @@ class MainWindow(QMainWindow):
         try:
             with open(csv_path, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['Timestamp', 'Frame_Index', 'IR_Value_Raw'])
+                writer.writerow(['Timestamp', 'Frame_Index', 'IR_Value_Raw', 'RED_Value_Raw'])
                 writer.writerows(buffer_data)
         except Exception: pass
 
@@ -626,12 +677,17 @@ class MainWindow(QMainWindow):
 
     def load_sensor_settings(self):
         self.ir_brightness = 100
+        self.red_brightness = 100
+        self.default_graph = "IR"
         setting_path = os.path.join("setting", "sensor_settings.json")
         if os.path.exists(setting_path):
             try:
                 with open(setting_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.ir_brightness = data.get("ir_brightness", 100)
+                    self.red_brightness = data.get("red_brightness", 100)
+                    dg = data.get("default_graph", "IR")
+                    self.default_graph = dg if dg in ("IR", "RED") else "IR"
             except Exception as e:
                 print(f"Failed to load sensor settings: {e}")
 
@@ -643,7 +699,9 @@ class MainWindow(QMainWindow):
             if os.path.exists(setting_path):
                 with open(setting_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            data["ir_brightness"] = self.spin_brightness.value()
+            data["ir_brightness"] = self.spin_ir_brightness.value()
+            data["red_brightness"] = self.spin_red_brightness.value()
+            data["default_graph"] = self.active_channel
             with open(setting_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
         except Exception as e:
