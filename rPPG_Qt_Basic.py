@@ -39,7 +39,7 @@ from modules.camera import BaseCameraThread
 class CameraThread(BaseCameraThread):
     def __init__(self):
         # Basic은 UserSet2를 기본으로 로드
-        super().__init__(gui_q=None, user_set="UserSet2", program_version="Basic")
+        super().__init__(gui_q=None, user_set="UserSet1", program_version="Basic")
         
     def process_frame(self, raw_data, capture_time):
         # Basic 버전: ROI 계산 없이 화면 렌더링만 진행
