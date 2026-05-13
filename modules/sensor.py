@@ -25,6 +25,7 @@ class SensorThread(QThread):
         self.last_seq = -1
         self.drop_count = 0
         self.last_check_time = time.time()
+        self.last_sample_time = 0
         self.DEFAULT_BAUD_RATE = 115200
 
     def set_port(self, port):
@@ -47,6 +48,7 @@ class SensorThread(QThread):
             self.drop_count = 0
             self.packet_count_1s = 0
             self.last_check_time = time.time()
+            self.last_sample_time = 0
             
             buffer = bytearray()
             PACKET_SIZE = 7
@@ -76,14 +78,18 @@ class SensorThread(QThread):
                             self.last_seq = seq
 
                             self.packet_count_1s += 1
-                            current_time = time.time()
-                            
+
+                            interval = 1.0 / 200.0
+                            actual_time = time.time()
+                            current_time = max(actual_time, self.last_sample_time + interval)
+                            self.last_sample_time = current_time
+
                             self.gui_q.append((current_time, ir_val))
-                            
-                            if current_time - self.last_check_time >= 1.0:
+
+                            if actual_time - self.last_check_time >= 1.0:
                                 self.update_stats_signal.emit(self.packet_count_1s, self.drop_count)
                                 self.packet_count_1s = 0
-                                self.last_check_time = current_time
+                                self.last_check_time = actual_time
 
                             if self.is_recording:
                                 self.record_buffer.append([current_time, seq, ir_val])
