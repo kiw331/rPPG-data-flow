@@ -1,8 +1,8 @@
-# 파일명: rPPG_Qt_LiveMonitor_JSON_Summary.py
-# 지시사항: 
-# 1. camera_all_settings.txt 파일 저장 시, 상단에 녹화 시간 및 현재 주요 카메라 설정(해상도, 오프셋, 포맷, FPS, 노출 등)을 JSON 형식으로 요약하여 작성
-# 2. 요약 정보 아래에 기존의 전체 카메라 설정 덤프를 이어붙여 빠른 확인과 상세 참고의 편의성을 동시에 제공
-# 3. 비디오 패널 동적 렌더링, 압축 UI, 와이드 화면 비율 등 이전 Adaptive UI 개선사항 유지
+# 파일명: rPPG_Qt_LiveMonitor.py
+#
+# [실행 방법]
+#   python rPPG_Qt_LiveMonitor.py            # 기본값: setting\camera_settings.json 불러오기
+#   python rPPG_Qt_LiveMonitor.py --reset    # UserSet 초기값으로 시작 (camera_settings.json 무시)
 
 import sys
 import os
@@ -82,8 +82,10 @@ class MainWindow(QMainWindow):
         self.resize(1350, 720) 
         
         self.load_roi_settings()
+        self.reset_mode = '--reset' in sys.argv
         self.load_sensor_settings()
         self.active_channel = self.default_graph  # 'IR' 또는 'RED'
+        self.saved_cam_settings = None if self.reset_mode else self._load_camera_settings_json()
 
         self.recording_duration = 60
         self.remaining_time = 0
@@ -362,31 +364,43 @@ class MainWindow(QMainWindow):
 
         self.set_channel(self.default_graph)
 
-    def sync_ui_with_camera(self, settings):
-        self.spin_cam_fps.blockSignals(True)
-        self.spin_cam_exp.blockSignals(True)
-        self.combo_cam_format.blockSignals(True)
-        self.combo_cam_color.blockSignals(True)
+    def sync_ui_with_camera(self, cam_init):
+        for w in (self.spin_cam_fps, self.spin_cam_exp,
+                  self.combo_cam_format, self.combo_cam_color):
+            w.blockSignals(True)
 
-        if 'fps' in settings and settings['fps'] is not None: 
-            rounded_fps = int(round(float(settings['fps'])))
-            self.spin_cam_fps.setValue(rounded_fps)
-        if 'exp' in settings and settings['exp'] is not None: 
-            self.spin_cam_exp.setValue(int(settings['exp']))
-            
-        if 'format' in settings and settings['format'] is not None:
+        if self.saved_cam_settings is not None:
+            s = self.saved_cam_settings
+            if "fps" in s:
+                self.spin_cam_fps.setValue(float(s["fps"]))
+            if "exposure" in s:
+                self.spin_cam_exp.setValue(int(s["exposure"]))
+            if "format" in s:
+                self.combo_cam_format.setCurrentText(s["format"])
+            if "color_temp" in s:
+                idx = self.combo_cam_color.findText(s["color_temp"])
+                if idx >= 0: self.combo_cam_color.setCurrentIndex(idx)
+            if "resolution_preset" in s:
+                idx = self.combo_cam_res.findText(s["resolution_preset"])
+                if idx >= 0: self.combo_cam_res.setCurrentIndex(idx)
+        else:
             fmt_map = {"BayerRG12": "Bayer RG 12", "BayerRG8": "Bayer RG 8", "BGR8": "BGR 8"}
-            if settings['format'] in fmt_map:
-                self.combo_cam_format.setCurrentText(fmt_map[settings['format']])
-                
-        if 'color' in settings and settings['color'] is not None:
-            idx = self.combo_cam_color.findText(settings['color'])
-            if idx >= 0: self.combo_cam_color.setCurrentIndex(idx)
+            if cam_init.get('fps') is not None:
+                self.spin_cam_fps.setValue(int(round(float(cam_init['fps']))))
+            if cam_init.get('exp') is not None:
+                self.spin_cam_exp.setValue(int(cam_init['exp']))
+            if cam_init.get('format') in fmt_map:
+                self.combo_cam_format.setCurrentText(fmt_map[cam_init['format']])
+            if cam_init.get('color') is not None:
+                idx = self.combo_cam_color.findText(cam_init['color'])
+                if idx >= 0: self.combo_cam_color.setCurrentIndex(idx)
 
-        self.spin_cam_fps.blockSignals(False)
-        self.spin_cam_exp.blockSignals(False)
-        self.combo_cam_format.blockSignals(False)
-        self.combo_cam_color.blockSignals(False)
+        for w in (self.spin_cam_fps, self.spin_cam_exp,
+                  self.combo_cam_format, self.combo_cam_color):
+            w.blockSignals(False)
+
+        if self.saved_cam_settings is not None:
+            self.apply_camera_settings()
 
     def refresh_ports(self):
         self.combo_ports.clear()
@@ -707,7 +721,33 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Failed to save sensor settings: {e}")
 
+    def _load_camera_settings_json(self):
+        path = os.path.join("setting", "camera_settings.json")
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"[Camera Settings] 불러오기 실패: {e}")
+        return None
+
+    def _save_camera_settings_json(self):
+        os.makedirs("setting", exist_ok=True)
+        data = {
+            "format":            self.combo_cam_format.currentText(),
+            "fps":               self.spin_cam_fps.value(),
+            "exposure":          self.spin_cam_exp.value(),
+            "color_temp":        self.combo_cam_color.currentText(),
+            "resolution_preset": self.combo_cam_res.currentText()
+        }
+        try:
+            with open(os.path.join("setting", "camera_settings.json"), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"[Camera Settings] 저장 실패: {e}")
+
     def closeEvent(self, event):
+        self._save_camera_settings_json()
         self.save_roi_settings()
         self.save_sensor_settings()
         self.video_thread.is_running = False
