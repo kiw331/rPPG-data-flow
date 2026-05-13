@@ -129,17 +129,23 @@ class BaseCameraThread(QThread):
         pass
         
     def render_base_pixmap(self, raw_data):
-        """기본 BGR8 / Bayer 변환 후 스케일 축소된 view_8bit 이미지를 반환합니다."""
+        """기본 BGR8 / Bayer 변환 후 스케일 축소된 view_8bit 이미지를 반환합니다.
+        
+        [중요] Basler BayerRG12 데이터에는 cv2.COLOR_BayerBG2RGB (코드 48)를 사용.
+        이는 cv2.COLOR_BayerRG2BGR과 동일한 내부 연산이며,
+        pyqtgraph용 raw_analysis.py의 BayerRG2BGR과 같은 연산임.
+        """
         import cv2
         if self.current_format == "BGR8":
             view_rgb = cv2.cvtColor(raw_data, cv2.COLOR_BGR2RGB)
-            view_rgb = cv2.resize(view_rgb, (0, 0), fx=0.5, fy=0.5) 
+            view_rgb = cv2.resize(view_rgb, (0, 0), fx=0.5, fy=0.5)
             view_8bit = view_rgb
         else:
+            # QImage.Format_RGB888용 RGB 출력 — BayerBG2RGB(code 48) 사용
             view_rgb = cv2.cvtColor(raw_data, cv2.COLOR_BayerBG2RGB)
-            view_rgb = cv2.resize(view_rgb, (0, 0), fx=0.5, fy=0.5) 
+            view_rgb = cv2.resize(view_rgb, (0, 0), fx=0.5, fy=0.5)
             if self.current_format == "BayerRG12":
-                view_8bit = (view_rgb >> 4).astype(np.uint8)
+                view_8bit = (view_rgb >> 4).astype(np.uint8)  # 12bit → 8bit
             else:
                 view_8bit = view_rgb.astype(np.uint8)
         return view_8bit

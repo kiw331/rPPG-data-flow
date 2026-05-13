@@ -113,6 +113,8 @@ class MainWindow(QMainWindow):
         self.sensor_thread.finished_signal.connect(self.save_csv_data)
         self.sensor_thread.connection_status_signal.connect(self.on_sensor_connected)
 
+        self.update_areas() # UI에 로드된 ROI 설정값을 카메라 스레드에 동기화
+        
         self.video_thread.start()
 
         self.timer = QTimer()
@@ -533,7 +535,7 @@ class MainWindow(QMainWindow):
             self.validate_recording()
             self.video_thread.is_running = False
             self.video_thread.wait(1000)
-            QApplication.quit() 
+            self.close()
 
     def validate_recording(self):
         try:
@@ -548,7 +550,7 @@ class MainWindow(QMainWindow):
             if duration <= 0: return
             
             expected_frames = int(duration * target_fps)
-            csv_path = os.path.join(self.video_thread.save_dir, "camera_timestamps.csv")
+            csv_path = os.path.join(self.current_save_dir, "camera_timestamps.csv")
             actual_frames = 0
             if os.path.exists(csv_path):
                 with open(csv_path, 'r', encoding='utf-8') as f:

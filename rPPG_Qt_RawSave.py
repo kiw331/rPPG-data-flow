@@ -457,7 +457,7 @@ class MainWindow(QMainWindow):
             self.validate_recording()
             self.video_thread.is_running = False
             self.video_thread.wait(1000)
-            QApplication.quit() 
+            self.close()
 
     def validate_recording(self):
         try:
@@ -472,7 +472,7 @@ class MainWindow(QMainWindow):
             if duration <= 0: return
             
             expected_frames = int(duration * target_fps)
-            csv_path = os.path.join(self.video_thread.save_dir, "camera_timestamps.csv")
+            csv_path = os.path.join(self.current_save_dir, "camera_timestamps.csv")
             actual_frames = 0
             if os.path.exists(csv_path):
                 with open(csv_path, 'r', encoding='utf-8') as f:
