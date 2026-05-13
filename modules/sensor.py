@@ -31,9 +31,15 @@ class SensorThread(QThread):
     def set_port(self, port):
         self.port_name = port
 
+    def send_ir_brightness_command(self, val):
+        self.command_queue.put(f"I{val}\n".encode('utf-8'))
+
+    def send_red_brightness_command(self, val):
+        self.command_queue.put(f"R{val}\n".encode('utf-8'))
+
+    # 하위 호환 (구버전 호출부: IR 밝기로 처리)
     def send_brightness_command(self, val):
-        cmd_str = f"{val}\n" 
-        self.command_queue.put(cmd_str.encode('utf-8'))
+        self.send_ir_brightness_command(val)
 
     def run(self):
         try:
@@ -51,7 +57,7 @@ class SensorThread(QThread):
             self.last_sample_time = 0
             
             buffer = bytearray()
-            PACKET_SIZE = 7
+            PACKET_SIZE = 11
 
             while self.is_running:
                 while not self.command_queue.empty():
@@ -67,7 +73,8 @@ class SensorThread(QThread):
                     while len(buffer) >= PACKET_SIZE:
                         if buffer[0] == 0xA5 and buffer[1] == 0x5A:
                             seq = buffer[2]
-                            ir_val = struct.unpack('<I', buffer[3:7])[0]
+                            ir_val  = struct.unpack('<I', buffer[3:7])[0]
+                            red_val = struct.unpack('<I', buffer[7:11])[0]
                             del buffer[:PACKET_SIZE]
 
                             if self.last_seq != -1:
@@ -84,7 +91,7 @@ class SensorThread(QThread):
                             current_time = max(actual_time, self.last_sample_time + interval)
                             self.last_sample_time = current_time
 
-                            self.gui_q.append((current_time, ir_val))
+                            self.gui_q.append((current_time, ir_val, red_val))
 
                             if actual_time - self.last_check_time >= 1.0:
                                 self.update_stats_signal.emit(self.packet_count_1s, self.drop_count)
@@ -92,7 +99,7 @@ class SensorThread(QThread):
                                 self.last_check_time = actual_time
 
                             if self.is_recording:
-                                self.record_buffer.append([current_time, seq, ir_val])
+                                self.record_buffer.append([current_time, seq, ir_val, red_val])
                         else:
                             del buffer[0]
                 else:
