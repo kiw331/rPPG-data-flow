@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer
 
 # PixelFormat 이름 -> OpenCV Bayer 변환 코드 매핑
-# pyqtgraph의 setImage()는 배열을 BGR 순서로 해석하므로 출력을 BGR로 지정
+# Fix Log: 이 카메라에서 올바른 연산 = 코드 48 (BayerRG2BGR = BayerBG2RGB)
 _BAYER_CODE_MAP = {
     "BayerRG12": cv2.COLOR_BayerRG2BGR,
     "BayerGB12": cv2.COLOR_BayerGB2BGR,
@@ -25,7 +25,7 @@ _BAYER_CODE_MAP = {
 }
 
 def get_bayer_code(pixel_format: str) -> int:
-    """PixelFormat 문자열에서 OpenCV 변환 코드 반환. 알 수 없으면 BayerRG2BGR 기본."""
+    """PixelFormat 문자열에서 OpenCV 변환 코드 반환. 알 수 없으면 BayerRG2BGR(코드48) 기본."""
     return _BAYER_CODE_MAP.get(pixel_format, cv2.COLOR_BayerRG2BGR)
 
 
@@ -683,21 +683,24 @@ class HistPopup(QDialog):
         with open(f_path, 'rb') as f:
             raw_data = np.frombuffer(f.read(), dtype=np.uint16)
         img = raw_data.reshape((self.raw_h, self.raw_w))
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BayerRG2RGB)
+        # Fix Log: 코드 48 (BayerRG2BGR) = 이 카메라에서 실증된 올바른 연산
+        img_display = cv2.cvtColor(img, cv2.COLOR_BayerRG2BGR)
 
-        self.current_img_rgb = img_rgb
-        img_pg = np.transpose(img_rgb, (1, 0, 2))
-        self.image_view.setImage(img_pg, autoRange=False)
+        self.current_img_rgb = img_display
+        img_pg = np.transpose(img_display, (1, 0, 2))
+        # autoLevels=False: 매 프레임 자동 정규화 비활성화 → 플리커 방지
+        levels = (0, 255) if img_display.dtype == np.uint8 else (0, 4095)
+        self.image_view.setImage(img_pg, autoRange=False, autoLevels=False, levels=levels)
 
         if not hasattr(self, 'x_range_initialized'):
             self.spin_x_min.blockSignals(True)
             self.spin_x_max.blockSignals(True)
             
             self.spin_x_min.setValue(0)
-            if img_rgb.dtype == np.uint8:
+            if self.current_img_rgb.dtype == np.uint8:
                 self.spin_x_max.setValue(256)
             else:
-                img_max = img_rgb.max()
+                img_max = self.current_img_rgb.max()
                 if img_max <= 4096:
                     self.spin_x_max.setValue(4096)
                 elif img_max <= 16384:
@@ -1213,15 +1216,17 @@ class MainWindow(QMainWindow):
         with open(f_path, 'rb') as f:
             raw_data = np.frombuffer(f.read(), dtype=np.uint16)
         img = raw_data.reshape((self.raw_h, self.raw_w))
+        # pyqtgraph는 RGB를 기대 → 코드 매핑에서 RGB 출력 코드를 사용
         bayer_code = get_bayer_code(self.pixel_format)
         if bayer_code is not None:
-            img_rgb = cv2.cvtColor(img, bayer_code)
+            img_display = cv2.cvtColor(img, bayer_code)
         else:
-            img_rgb = np.stack([img, img, img], axis=2)
+            img_display = np.stack([img, img, img], axis=2)  # Mono12
 
-        # pyqtgraph ImageView는 axes (x, y, color) -> shape (W, H, 3) 기대
-        img_pg = np.transpose(img_rgb, (1, 0, 2))
-        self.image_view.setImage(img_pg, autoRange=False)
+        img_pg = np.transpose(img_display, (1, 0, 2))
+        # autoLevels=False: 매 프레임 자동 정규화 비활성화 → 플리커 방지
+        levels = (0, 255) if img_display.dtype == np.uint8 else (0, 4095)
+        self.image_view.setImage(img_pg, autoRange=False, autoLevels=False, levels=levels)
 
     # -----------------------------------------------------------------
     # ROI 설정

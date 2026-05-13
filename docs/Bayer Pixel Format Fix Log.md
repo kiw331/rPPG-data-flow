@@ -94,3 +94,60 @@ GetArray() → img_queue.put(raw_data) → tifffile.imwrite()
   불러올 때 `len(img.shape) == 2`로 체크하여 Bayer 변환 적용.
 - BGR8 포맷으로 저장된 TIFF는 `uint8` 3채널 배열. 변환 없이 그대로 사용.
 - OffsetX=208, OffsetY=28 (짝수 오프셋)은 Bayer 위상에 영향을 주지 않음.
+
+---
+
+## 7. AVI 영상 저장 파이프라인 — 파이프라인별 코드 정리 (2026-04-28 추가)
+
+### 배경
+`modules/tiff_to_avi.py` 모듈로 TIFF 시퀀스 → AVI 변환 시, 처음에 파란색 영상이 출력됨.  
+원인: pyqtgraph용 코드 48(`BayerRG2BGR`)을 VideoWriter 파이프라인에 그대로 사용한 것.
+
+### 핵심: 파이프라인별 Bayer 코드가 다르다
+
+| 출력 대상 | 채널 해석 방식 | 올바른 Bayer 코드 | 내부 번호 |
+|---|---|---|---|
+| `pyqtgraph.ImageView.setImage()` | channel[0] = **R** 로 해석 | `COLOR_BayerRG2BGR` | 48 ✅ |
+| `cv2.VideoWriter.write()` → 미디어플레이어 | channel[0] = **B** 로 해석 (표준 BGR) | `COLOR_BayerBG2BGR` | 46 ✅ |
+| `QImage.Format_RGB888` → `QLabel` | channel[0] = **R** 로 해석 | `COLOR_BayerBG2RGB` | 48 ✅ |
+
+> 코드 46 = `BayerBG2BGR` = `BayerRG2RGB` (동일 연산)  
+> 코드 48 = `BayerRG2BGR` = `BayerBG2RGB` (동일 연산)
+
+### `modules/tiff_to_avi.py` 최종 코드
+
+```python
+# VideoWriter는 표준 BGR → 코드 46 사용
+bayer_map = {
+    "BAYERRG": cv2.COLOR_BayerBG2BGR,   # 코드 46
+    ...
+}
+```
+
+---
+
+## 8. BGR8 TIFF 채널 순서 이슈 (2026-04-28 추가)
+
+### 발견된 문제
+`rPPG-analysis-tool.py`에서 BGR8 포맷 데이터를 불러올 때 파란색으로 표시됨.
+
+### 원인
+- Basler BGR8 데이터: `GetArray()` → channel[0]=B, channel[2]=R
+- `tifffile.imwrite()`는 3채널 배열을 **RGB 태그**로 TIFF에 저장
+- `tifffile.imread()`로 읽으면 바이트 순서 그대로 반환 (BGR 유지)
+- pyqtgraph는 channel[0]=**R**로 해석 → R과 B가 뒤집혀 파랗게 표시
+
+### 파이프라인별 처리 방법
+
+```python
+# pyqtgraph 표시용 (channel[0]을 R로 해석)
+if len(img.shape) == 2:  # BayerRG12
+    img_display = cv2.cvtColor(img, cv2.COLOR_BayerRG2BGR)  # 코드 48
+else:  # BGR8
+    img_display = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # BGR→RGB 명시 변환
+
+# VideoWriter용 (channel[0]을 B로 해석, BGR 그대로 OK)
+if len(img.shape) == 3:  # BGR8
+    bgr = img.astype(np.uint8)  # 변환 불필요
+```
+
