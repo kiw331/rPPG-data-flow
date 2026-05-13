@@ -63,7 +63,7 @@ def resample_folder(folder: str) -> bool:
 
 
 def main():
-    root = sys.argv[1] if len(sys.argv) > 1 else r"data\basler_0303"
+    root = sys.argv[1] if len(sys.argv) > 1 else r"data\basler_0507"
 
     if not os.path.isdir(root):
         print(f"[오류] 폴더가 존재하지 않습니다: {root}")
