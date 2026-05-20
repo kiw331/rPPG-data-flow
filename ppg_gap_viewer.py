@@ -1,0 +1,634 @@
+"""
+ppg_gap_viewer.py  —  PPG 재구성 + 갭 비교 뷰어
+
+실행: python ppg_gap_viewer.py
+
+기능:
+  - hr_segments.csv 기반 재구성 (Method 5 + 엔벨로프 정규화)
+  - 갭 구간 네비게이션 (이전/다음)
+  - 원신호(Raw) / 재구성 신호 2-패널 비교
+  - 폴더 전환 (이전/다음 폴더)
+  - 그래프 확대/축소: 마우스 우클릭 드래그, 휠
+"""
+
+import sys
+import os
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt, find_peaks
+from scipy.ndimage import uniform_filter1d
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QFileDialog, QDoubleSpinBox,
+    QSplitter,
+)
+from PyQt5.QtCore import Qt
+import pyqtgraph as pg
+
+# ── 파일명 ──────────────────────────────────────────────────────────
+PPG_CSV   = "ppg_sensor.csv"
+LABEL_CSV = "hr_segments.csv"
+
+# ── 처리 기본값 ─────────────────────────────────────────────────────
+PAD_SEC    = 0.30
+MA_WIN_SEC = 0.15
+BPF_ORDER  = 4
+PEAK_PROM  = 0.3
+
+
+# ────────────────────────────────────────────────────────────────────
+class PPGGapViewer(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PPG 재구성 갭 뷰어")
+        self.resize(1400, 900)
+
+        self.current_folder = None
+        self._t        = None
+        self._sig_raw  = None
+        self._labels   = None
+        self._fs       = 200.0
+
+        self._valid_segs = []
+        self._gaps       = []
+        self._sig_rp     = None   # 실신호 (NaN 마스킹)
+        self._sig_sp     = None   # 합성신호 (NaN 마스킹)
+        self._gap_idx    = 0
+
+        self._raw_region_items = []
+        self._rc_region_items  = []
+
+        self._init_ui()
+
+    # ── UI ──────────────────────────────────────────────────────────
+    def _init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+
+        # 행1: 폴더 컨트롤
+        row1 = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("ppg_sensor.csv + hr_segments.csv 폴더 경로...")
+        self.path_edit.returnPressed.connect(
+            lambda: self.load_folder(self.path_edit.text().strip()))
+        btn_browse = QPushButton("📁 폴더 선택")
+        btn_browse.clicked.connect(self._browse)
+        self.btn_prev_folder = QPushButton("◀ 이전 폴더")
+        self.btn_prev_folder.clicked.connect(self._prev_folder)
+        self.btn_next_folder = QPushButton("다음 폴더 ▶")
+        self.btn_next_folder.clicked.connect(self._next_folder)
+        row1.addWidget(self.path_edit, stretch=1)
+        row1.addWidget(btn_browse)
+        row1.addWidget(self.btn_prev_folder)
+        row1.addWidget(self.btn_next_folder)
+        root.addLayout(row1)
+
+        # 행2: 파라미터 + 갭 네비게이션
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("BPF (Hz):"))
+        self.spin_lo = QDoubleSpinBox()
+        self.spin_lo.setRange(0.1, 20.0); self.spin_lo.setSingleStep(0.5)
+        self.spin_lo.setValue(3.0)
+        row2.addWidget(self.spin_lo)
+        row2.addWidget(QLabel("~"))
+        self.spin_hi = QDoubleSpinBox()
+        self.spin_hi.setRange(1.0, 50.0); self.spin_hi.setSingleStep(0.5)
+        self.spin_hi.setValue(12.0)
+        row2.addWidget(self.spin_hi)
+        btn_proc = QPushButton("⚙️ 재처리")
+        btn_proc.clicked.connect(self._process_and_draw)
+        row2.addWidget(btn_proc)
+        row2.addSpacing(30)
+
+        self.btn_prev_gap = QPushButton("◀ 이전 갭")
+        self.btn_prev_gap.clicked.connect(self._prev_gap)
+        self.lbl_gap = QLabel("갭  -/-")
+        self.lbl_gap.setAlignment(Qt.AlignCenter)
+        self.lbl_gap.setMinimumWidth(100)
+        self.btn_next_gap = QPushButton("다음 갭 ▶")
+        self.btn_next_gap.clicked.connect(self._next_gap)
+        btn_full = QPushButton("🔭 전체 보기")
+        btn_full.clicked.connect(self._full_view)
+
+        row2.addWidget(self.btn_prev_gap)
+        row2.addWidget(self.lbl_gap)
+        row2.addWidget(self.btn_next_gap)
+        row2.addSpacing(20)
+        row2.addWidget(btn_full)
+        row2.addStretch()
+        self.lbl_status = QLabel("폴더를 선택하세요")
+        self.lbl_status.setStyleSheet("color:#555;")
+        row2.addWidget(self.lbl_status)
+        root.addLayout(row2)
+
+        # 갭 상세 정보
+        self.lbl_gap_info = QLabel("")
+        self.lbl_gap_info.setStyleSheet("color:#1565C0; font-weight:bold; padding:2px;")
+        root.addWidget(self.lbl_gap_info)
+
+        # 그래프
+        splitter = QSplitter(Qt.Vertical)
+        root.addWidget(splitter, stretch=1)
+
+        # Raw plot
+        self.plot_raw = pg.PlotWidget(
+            title="<b>원신호 (Raw ADC)</b>  |  "
+                  "■ 초록=피크 탐지 성공 구간 (실신호 사용)  "
+                  "■ 파랑=hr_segments 라벨 원본  "
+                  "■ 빨강=갭 (합성 보간 대상)")
+        self.plot_raw.setBackground('w')
+        self.plot_raw.showGrid(x=True, y=True, alpha=0.25)
+        self.plot_raw.setLabel('left', 'ADC')
+        self.plot_raw.setLabel('bottom', 'Time (s)')
+        # y축 자동 스케일: 보이는 X 구간에 맞춰 y 범위 조정 → DC 오프셋 문제 해결
+        self.plot_raw.getViewBox().setAutoVisible(y=True)
+        self.plot_raw.enableAutoRange(axis='y', enable=True)
+        self.curve_raw = self.plot_raw.plot(pen=pg.mkPen('#333333', width=0.8))
+        splitter.addWidget(self.plot_raw)
+
+        # Reconstruction plot
+        self.plot_rc = pg.PlotWidget(
+            title="<b>재구성 신호 (정규화 [-1, +1])</b>  |  "
+                  "─ 파랑=실신호 기반 정규화  "
+                  "-- 주황=갭 구간 코사인 합성 보간")
+        self.plot_rc.setBackground('w')
+        self.plot_rc.showGrid(x=True, y=True, alpha=0.25)
+        self.plot_rc.setLabel('left', '정규화 진폭')
+        self.plot_rc.setLabel('bottom', 'Time (s)')
+        self.curve_real  = self.plot_rc.plot(
+            pen=pg.mkPen('#1f77b4', width=1.3), name='실신호')
+        self.curve_synth = self.plot_rc.plot(
+            pen=pg.mkPen('#ff7f0e', width=1.3, style=Qt.DashLine), name='합성')
+        self.plot_rc.setYRange(-1.6, 1.6)
+        splitter.addWidget(self.plot_rc)
+        splitter.setSizes([480, 380])
+
+        # X축 링크 (두 그래프가 같이 스크롤/줌)
+        self.plot_rc.setXLink(self.plot_raw)
+
+    # ── 폴더 탐색 ───────────────────────────────────────────────────
+    def _browse(self):
+        path = QFileDialog.getExistingDirectory(self, "폴더 선택")
+        if path:
+            self.load_folder(path)
+
+    def _siblings(self):
+        if not self.current_folder:
+            return []
+        parent = os.path.dirname(self.current_folder)
+        try:
+            return sorted([
+                os.path.join(parent, d)
+                for d in os.listdir(parent)
+                if os.path.isdir(os.path.join(parent, d))
+                   and os.path.exists(os.path.join(parent, d, PPG_CSV))
+            ])
+        except Exception:
+            return []
+
+    def _prev_folder(self):
+        sib = self._siblings()
+        if not sib:
+            return
+        cur = os.path.normcase(os.path.normpath(self.current_folder))
+        idx = next((i for i, s in enumerate(sib)
+                    if os.path.normcase(os.path.normpath(s)) == cur), -1)
+        if idx > 0:
+            self.load_folder(sib[idx - 1])
+
+    def _next_folder(self):
+        sib = self._siblings()
+        if not sib:
+            return
+        cur = os.path.normcase(os.path.normpath(self.current_folder))
+        idx = next((i for i, s in enumerate(sib)
+                    if os.path.normcase(os.path.normpath(s)) == cur), -1)
+        if 0 <= idx < len(sib) - 1:
+            self.load_folder(sib[idx + 1])
+
+    def load_folder(self, path):
+        path = os.path.normpath(path)
+        ppg_path   = os.path.join(path, PPG_CSV)
+        label_path = os.path.join(path, LABEL_CSV)
+
+        if not os.path.exists(ppg_path):
+            self.lbl_status.setText(f"❌ {PPG_CSV} 없음: {path}")
+            return
+
+        self.current_folder = path
+        self.path_edit.setText(path)
+        self.setWindowTitle(f"PPG 재구성 갭 뷰어 — {os.path.basename(path)}")
+
+        df            = pd.read_csv(ppg_path).dropna()
+        self._sig_raw = df["IR_Value_Raw"].values.astype(float)
+        t_raw         = df["Timestamp"].values
+        self._t       = t_raw - t_raw[0]
+        self._fs      = 1.0 / np.median(np.diff(self._t))
+
+        if os.path.exists(label_path):
+            self._labels = pd.read_csv(label_path)
+        else:
+            self._labels = pd.DataFrame(
+                columns=["segment_id", "start_time", "end_time", "length"])
+            self.lbl_status.setText("⚠️ hr_segments.csv 없음 — Raw만 표시")
+
+        self._process_and_draw()
+
+    # ── 처리 ────────────────────────────────────────────────────────
+    def _process_and_draw(self):
+        if self._t is None:
+            return
+
+        bpf_lo  = self.spin_lo.value()
+        bpf_hi  = self.spin_hi.value()
+        fs      = self._fs
+        t       = self._t
+        sig_raw = self._sig_raw
+
+        # ── 내부 함수 ──
+        def bpf(sig):
+            nyq  = fs / 2
+            hi   = min(bpf_hi, nyq * 0.98)
+            b, a = butter(BPF_ORDER, [bpf_lo / nyq, hi / nyq], btype='band')
+            return filtfilt(b, a, sig)
+
+        def proc_iso(s, e):
+            sp = max(t[0], s - PAD_SEC)
+            ep = min(t[-1], e + PAD_SEC)
+            m  = (t >= sp) & (t <= ep)
+            te, se = t[m], sig_raw[m].copy()
+            ma_n   = max(3, int(MA_WIN_SEC * fs))
+            sdt    = se - uniform_filter1d(se, ma_n)
+            sbf    = bpf(sdt)
+            inner  = (te >= s) & (te <= e)
+            return te[inner], sbf[inner]
+
+        def detect(ts, ss, seg_start, seg_end):
+            prom      = ss.std() * PEAK_PROM
+            prom_edge = ss.std() * 0.12
+            mind_boot = max(2, int(0.05 * fs))   # 부트스트랩용 느슨한 최소 간격(50ms)
+
+            # ── Step 1: 부트스트랩 탐지 → 평균 주기 추정 ──
+            pk0, _ = find_peaks(ss, distance=mind_boot, prominence=prom)
+            if len(pk0) < 2:
+                vl0, _ = find_peaks(-ss, distance=mind_boot, prominence=prom)
+                return pk0, vl0, False, False
+            avg_T = np.median(np.diff(ts[pk0]))
+
+            # ── Step 2: 본 탐지 — 최소 간격 0.6×avg_T (한 파형 이중 탐지 방지) ──
+            mind = max(mind_boot, round(0.6 * avg_T * fs))
+            pk, _ = find_peaks( ss, distance=mind, prominence=prom)
+            vl, _ = find_peaks(-ss, distance=mind, prominence=prom)
+            if len(pk) < 2:
+                return pk, vl, False, False
+
+            avg_T = np.median(np.diff(ts[pk]))   # 재계산
+
+            # ── Step 2.5: 내부 누락 피크/밸리 보완 ──
+            # 인접 피크 간격이 1.4×avg_T 초과 → 그 사이에 피크가 누락됐을 가능성
+            # find_peaks 완화 탐지 후 실패 시 argmax 강제 사용
+            def _fill_interior(arr, invert=False):
+                """arr: 피크 또는 밸리 인덱스 배열. invert=True이면 밸리(음수 신호)."""
+                nonlocal avg_T
+                changed = True
+                while changed:
+                    changed = False
+                    if len(arr) < 2:
+                        break
+                    ivls = np.diff(ts[arr])
+                    for i in np.where(ivls > 1.4 * avg_T)[0]:
+                        t_mid = (ts[arr[i]] + ts[arr[i + 1]]) / 2
+                        win   = 0.35 * avg_T
+                        m_w   = (ts >= t_mid - win) & (ts <= t_mid + win)
+                        if m_w.sum() < 3:
+                            continue
+                        sig_w = -ss[m_w] if invert else ss[m_w]
+                        ep2, _ = find_peaks(sig_w, distance=mind_boot,
+                                            prominence=prom * 0.15)
+                        if len(ep2):
+                            cands = np.where(m_w)[0][ep2]
+                            new_i = cands[np.argmax(sig_w[ep2])]
+                        else:
+                            new_i = np.where(m_w)[0][np.argmax(sig_w)]
+                        arr = np.sort(np.unique(np.append(arr, new_i)))
+                        avg_T = np.median(np.diff(ts[arr]))
+                        changed = True
+                        break   # 재계산 후 while 재시작
+                return arr
+
+            # 내부 채우기 전 넓은 간격 기록 → env_norm 후 해당 구간 gen_synth 교체
+            interior_syn = []
+            if len(pk) >= 2:
+                for i in np.where(np.diff(ts[pk]) > 1.4 * avg_T)[0]:
+                    interior_syn.append((ts[pk[i]], ts[pk[i + 1]]))
+
+            pk = _fill_interior(pk, invert=False)
+            vl = _fill_interior(vl, invert=True)
+
+            avg_T  = np.median(np.diff(ts[pk]))
+            ref_pk = np.median(ss[pk])
+            edge_r = avg_T         # 양끝단 유효 탐색 반경
+
+            def _edge_search(t_lo, t_hi):
+                """경계 범위 안에서 양수이고 진폭 일관성을 만족하는 최대 피크 1개 반환."""
+                m = (ts >= t_lo) & (ts <= t_hi)
+                if m.sum() <= 3:
+                    return np.array([], dtype=int)
+                ep, _ = find_peaks(ss[m], distance=mind_boot, prominence=prom_edge)
+                if not len(ep):
+                    return np.array([], dtype=int)
+                abs_idx = np.where(m)[0][ep]
+                # 양수 피크만 허용 — 음수 로컬맥스는 실제 심박 피크가 아님
+                ok = (ss[abs_idx] > 0) & (ss[abs_idx] <= ref_pk * 1.8)
+                if not ok.any():
+                    return np.array([], dtype=int)
+                abs_idx = abs_idx[ok]
+                return np.array([abs_idx[np.argmax(ss[abs_idx])]])
+
+            def _period_forced(ref_t, direction):
+                """탐지 실패 시 인접 5개 파형 주기 중앙값으로 피크 위치 강제 결정.
+                direction: +1=ref_t 이후(tail), -1=ref_t 이전(head)"""
+                ivl  = np.diff(ts[pk])
+                N    = min(5, len(ivl))
+                m_T  = np.median(ivl[-N:] if direction == 1 else ivl[:N])
+                t_tg = ref_t + direction * m_T
+                return np.array([np.argmin(np.abs(ts - t_tg))])
+
+            forced_head = forced_tail = False
+
+            # ── Step 3: 첫 피크 위치 검증 ──
+            # 라벨 시작(골)에서 avg_T 이내에 첫 피크가 없으면 재탐색 후 주기 강제
+            if ts[pk[0]] > seg_start + edge_r:
+                new = _edge_search(seg_start, seg_start + edge_r)
+                if not len(new):
+                    new = _period_forced(ts[pk[0]], direction=-1)
+                    forced_head = True
+                pk = np.sort(np.unique(np.append(pk, new)))
+
+            # ── Step 4: 끝 피크 위치 검증 ──
+            # 라벨 종료(골)에서 avg_T 이내에 끝 피크가 없으면 재탐색 후 주기 강제
+            if ts[pk[-1]] < seg_end - edge_r:
+                new = _edge_search(seg_end - edge_r, seg_end)
+                if not len(new):
+                    new = _period_forced(ts[pk[-1]], direction=+1)
+                    forced_tail = True
+                pk = np.sort(np.unique(np.append(pk, new)))
+
+            return pk, vl, forced_head, forced_tail, interior_syn
+
+        def env_norm(tr, sr, tpk, spk, tvl, svl):
+            # 상·하한 엔벨로프를 '선형보간'으로 계산.
+            #  CubicSpline 은 진폭이 급변(정상 피크→artifact 피크)할 때
+            #  제어점 사이에서 오버슈트(아래로 처짐)하여 실신호가 엔벨로프를
+            #  벗어남(>+1) → 스파이크/평탄화 발생.
+            #  선형보간은 두 피크를 직선으로 잇기에 그 사이 신호(밸리로 하강)는
+            #  항상 직선 아래에 머무름이 수학적으로 보장됨 → 출력 [-1,+1] 보장.
+            upper = np.interp(tr, tpk, spk)   # 피크 선형보간
+            lower = np.interp(tr, tvl, svl)   # 밸리 선형보간 (양끝 자동 클램프)
+            denom = np.where(upper - lower < 1e-9, 1e-9, upper - lower)
+            return np.clip(2.0 * (sr - lower) / denom - 1.0, -1.0, 1.0)
+
+        def gen_synth(tg, T_start, T_end=None, valley_ref=-1.0):
+            # T_start: period at gap start (matches preceding real segment boundary)
+            # T_end:   period at gap end   (matches following real segment boundary)
+            # phase varies smoothly so d_phi/dt = 2pi/T(t) with T(t) linearly varying
+            if T_end is None:
+                T_end = T_start
+            dur = tg[-1] - tg[0]
+            if dur <= 0 or len(tg) < 2:
+                return np.full(len(tg), 1.0)
+
+            # Harmonic-mean period → integer cycle count
+            T_hmean = 2 * T_start * T_end / (T_start + T_end)
+            n_cyc   = max(1, round(dur / T_hmean))
+
+            # Angular frequencies at each end
+            w0    = 2 * np.pi / T_start
+            w1    = 2 * np.pi / T_end
+            alpha = (tg - tg[0]) / dur          # 0 → 1
+
+            # Integrate linearly-varying omega: phi = dur*(w0*a + (w1-w0)*a²/2)
+            phi_raw   = dur * (w0 * alpha + (w1 - w0) * alpha ** 2 / 2)
+            phi_total = phi_raw[-1]              # = dur*(w0+w1)/2
+
+            # Rescale so phi spans exactly 2pi*n_cyc → both endpoints at cos = +1
+            scale = (2 * np.pi * n_cyc) / phi_total if phi_total > 0 else 1.0
+            phi   = phi_raw * scale
+
+            mid = (1.0 + valley_ref) / 2
+            amp = (1.0 - valley_ref) / 2
+            return mid + amp * np.cos(phi)
+
+        # ── 세그먼트 처리 ──
+        segs = []
+        for _, row in self._labels.iterrows():
+            s, e   = row["start_time"], row["end_time"]
+            ts, ss = proc_iso(s, e)
+            if len(ts) < 10:
+                segs.append(None); continue
+
+            pk, vl, forced_head, forced_tail, interior_syn = detect(ts, ss, ts[0], ts[-1])
+            if len(pk) < 2 or len(vl) < 1:
+                segs.append(None); continue
+
+            tlo, thi = ts[pk[0]], ts[pk[-1]]
+            mpp = (ts >= tlo) & (ts <= thi)
+            if mpp.sum() < 5:
+                segs.append(None); continue
+
+            tr, sr = ts[mpp], ss[mpp]
+            pkr = pk[(ts[pk] >= tlo) & (ts[pk] <= thi)]
+            vlr = vl[(ts[vl] >= tlo) & (ts[vl] <= thi)]
+            if len(pkr) < 2 or len(vlr) < 1:
+                segs.append(None); continue
+
+            try:
+                sn = env_norm(tr, sr, ts[pkr], ss[pkr], ts[vlr], ss[vlr])
+            except Exception:
+                segs.append(None); continue
+
+            # ── 아티팩트 구간 gen_synth 교체 ──
+            # 공통 헬퍼: pkr 로컬 주기 중앙값으로 구간 [t0,t1]을 코사인으로 덮어씀
+            def _replace_syn(t0, t1):
+                m_s = (tr >= t0) & (tr <= t1)
+                if m_s.sum() < 2:
+                    return
+                ivl = np.diff(ts[pkr])
+                m_T = float(np.median(ivl)) if len(ivl) else (t1 - t0)
+                sn[m_s] = gen_synth(tr[m_s], m_T)
+
+            # 내부 넓은 간격: fill_interior 삽입 피크가 아티팩트 → env_norm 왜곡 → 교체
+            for t0, t1 in interior_syn:
+                _replace_syn(t0, t1)
+
+            # 끝단 강제 피크: 마지막 실 피크 ~ 강제 피크 구간 교체
+            if forced_tail and len(pkr) >= 2:
+                _replace_syn(ts[pkr[-2]], ts[pkr[-1]])
+
+            # 앞단 강제 피크: 강제 피크 ~ 첫 실 피크 구간 교체
+            if forced_head and len(pkr) >= 2:
+                _replace_syn(ts[pkr[0]], ts[pkr[1]])
+
+            pk_ivl      = np.diff(ts[pkr])
+            N_loc       = min(3, len(pk_ivl))
+            period_head = float(np.mean(pk_ivl[:N_loc]))
+            period_tail = float(np.mean(pk_ivl[-N_loc:]))
+
+            segs.append({
+                "t":           tr,
+                "sig":         sn,
+                "period":      float(np.median(pk_ivl)),
+                "period_head": period_head,   # local period near segment start
+                "period_tail": period_tail,   # local period near segment end
+                "t_s":         tlo,
+                "t_e":         thi,
+            })
+
+        valid = [s for s in segs if s is not None]
+
+        # ── 재구성 배열 ──
+        n      = len(t)
+        sig_rc = np.full(n, np.nan)
+        filled = np.zeros(n, bool)
+        is_syn = np.zeros(n, bool)
+
+        for seg in valid:
+            m = (t >= seg["t_s"]) & (t <= seg["t_e"])
+            sig_rc[m] = np.interp(t[m], seg["t"], seg["sig"])
+            filled[m] = True
+
+        for i in range(len(valid) - 1):
+            a, b    = valid[i], valid[i + 1]
+            gs, ge  = a["t_e"], b["t_s"]
+            if ge <= gs:
+                continue
+            # Use local period at each boundary for smooth frequency continuity
+            T_start = a["period_tail"]   # period just before the gap
+            T_end   = b["period_head"]   # period just after the gap
+            m_gap   = (t > gs) & (t < ge)
+            if m_gap.sum() < 2:
+                continue
+            sig_rc[m_gap] = gen_synth(t[m_gap], T_start, T_end)
+            filled[m_gap] = True
+            is_syn[m_gap] = True
+
+        self._valid_segs = valid
+        # sig_rp: 끊기지 않는 연속 재구성 (실신호 + 합성 모두 포함)
+        # sig_sp: 합성 구간만 (오버레이용) — NaN이 실신호 구간을 나누지 않으므로 파란선이 끊기지 않음
+        self._sig_rp = np.where(filled,  sig_rc, np.nan)
+        self._sig_sp = np.where(is_syn,  sig_rc, np.nan)
+
+        self._gaps = [
+            (valid[i]["t_e"], valid[i + 1]["t_s"], valid[i], valid[i + 1])
+            for i in range(len(valid) - 1)
+            if valid[i + 1]["t_s"] > valid[i]["t_e"]
+        ]
+        self._gap_idx = 0
+
+        self.lbl_status.setText(
+            f"fs={fs:.0f} Hz  |  세그먼트: {len(valid)}/{len(self._labels)}"
+            f"  |  갭: {len(self._gaps)}")
+
+        self._draw_all()
+        self._zoom_to_gap()
+
+    def _draw_all(self):
+        """곡선 + 배경 영역 전체 갱신"""
+        t = self._t
+
+        # 곡선
+        self.curve_raw.setData(t, self._sig_raw)
+        self.curve_real.setData( t, self._sig_rp, connect='finite')
+        self.curve_synth.setData(t, self._sig_sp, connect='finite')
+
+        # 기존 영역 아이템 제거
+        for item in self._raw_region_items:
+            self.plot_raw.removeItem(item)
+        for item in self._rc_region_items:
+            self.plot_rc.removeItem(item)
+        self._raw_region_items.clear()
+        self._rc_region_items.clear()
+
+        def add_region(x0, x1, r, g, b, a):
+            brush = pg.mkBrush(r, g, b, a)
+            pen   = pg.mkPen(None)
+            for plot, lst in ((self.plot_raw, self._raw_region_items),
+                              (self.plot_rc,  self._rc_region_items)):
+                item = pg.LinearRegionItem(values=[x0, x1],
+                                           movable=False, brush=brush, pen=pen)
+                plot.addItem(item)
+                lst.append(item)
+
+        # 라벨 구간 (파랑)
+        for _, row in self._labels.iterrows():
+            add_region(row["start_time"], row["end_time"], 30, 100, 220, 40)
+
+        # peak-to-peak 실구간 (초록)
+        for seg in self._valid_segs:
+            add_region(seg["t_s"], seg["t_e"], 30, 180, 60, 55)
+
+        # 갭 구간 (빨강)
+        for gs, ge, *_ in self._gaps:
+            add_region(gs, ge, 220, 30, 30, 35)
+
+    def _zoom_to_gap(self):
+        if not self._gaps:
+            self.lbl_gap.setText("갭 없음")
+            self.lbl_gap_info.setText("")
+            return
+
+        idx          = self._gap_idx
+        gs, ge, a, b = self._gaps[idx]
+        pad          = max(0.3, ge - gs)
+
+        self.plot_raw.setXRange(gs - pad, ge + pad, padding=0)
+        # plot_rc는 XLink로 자동 동기화
+
+        T_s   = a["period_tail"]
+        T_e   = b["period_head"]
+        bpm_s = 60.0 / T_s if T_s > 0 else 0
+        bpm_e = 60.0 / T_e if T_e > 0 else 0
+        self.lbl_gap.setText(f"갭  {idx + 1} / {len(self._gaps)}")
+        self.lbl_gap_info.setText(
+            f"갭 #{idx + 1}  |  {gs:.3f}s ~ {ge:.3f}s  |  "
+            f"길이 {ge - gs:.3f}s  |  "
+            f"전 {T_s*1000:.1f}ms ({bpm_s:.0f}BPM) → 후 {T_e*1000:.1f}ms ({bpm_e:.0f}BPM)"
+        )
+
+    # ── 갭 네비게이션 ───────────────────────────────────────────────
+    def _prev_gap(self):
+        if self._gap_idx > 0:
+            self._gap_idx -= 1
+            self._zoom_to_gap()
+
+    def _next_gap(self):
+        if self._gap_idx < len(self._gaps) - 1:
+            self._gap_idx += 1
+            self._zoom_to_gap()
+
+    def _full_view(self):
+        if self._t is not None:
+            self.plot_raw.setXRange(self._t[0], self._t[-1], padding=0.01)
+
+    # ── 키보드 단축키 ────────────────────────────────────────────────
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Left:
+            self._prev_gap()
+        elif event.key() == Qt.Key_Right:
+            self._next_gap()
+        elif event.key() == Qt.Key_Home:
+            self._full_view()
+        else:
+            super().keyPressEvent(event)
+
+
+# ────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    pg.setConfigOptions(antialias=True)
+    win = PPGGapViewer()
+    win.show()
+    sys.exit(app.exec_())
