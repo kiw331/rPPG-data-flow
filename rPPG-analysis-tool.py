@@ -14,23 +14,136 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer
 
 # =====================================================================
-# 분석 스레드 (QThread)
+# SAM3 선택적 로딩 함수
 # =====================================================================
+HAS_SAM3 = False
+sam3_model_builder = None
+Sam3Processor = None
+
+def try_import_sam3(force_no=False):
+    global HAS_SAM3, sam3_model_builder, Sam3Processor
+    if force_no:
+        HAS_SAM3 = False
+        return False
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            print("[SAM3] CUDA is not available. Disabling SAM3 mode.")
+            HAS_SAM3 = False
+            return False
+        
+        # sam3 임포트 시도
+        import sam3
+        from sam3.model_builder import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor as Processor
+        
+        sam3_model_builder = build_sam3_image_model
+        Sam3Processor = Processor
+        HAS_SAM3 = True
+        print("[SAM3] SAM3 successfully imported with CUDA support.")
+        return True
+    except Exception as e:
+        print(f"[SAM3] SAM3 Import failed or disabled: {e}")
+        HAS_SAM3 = False
+        return False
+
+
+# ====================================
 class AnalysisWorker(QThread):
     progress_signal = pyqtSignal(int, str)
     finished_signal = pyqtSignal(dict) # 결과 데이터 딕셔너리 전달
     error_signal = pyqtSignal(str)
 
-    def __init__(self, folder_path, start_frame_idx, duration_sec, rois_info, bg_roi_info, bpm_min, bpm_max):
+    def __init__(self, folder_path, start_frame_idx, duration_sec, rois_info, bg_roi_info, bpm_min, bpm_max,
+                 roi_mode="manual", sam3_model=None, active_sam3_rois=None, sam_conf=0.3, sam_min_area=100):
         super().__init__()
         self.folder_path = folder_path
         self.start_frame_idx = start_frame_idx
         self.duration_sec = duration_sec
-        self.rois_info = rois_info # list of (x, y, w, h) for ROI 1~3
-        self.bg_roi_info = bg_roi_info # (x, y, w, h) or None
+        self.rois_info = rois_info # list of (x, y, w, h) for ROI 1~3 (manual 모드용)
+        self.bg_roi_info = bg_roi_info # (x, y, w, h) or None (manual 모드용)
         self.bpm_min = bpm_min
         self.bpm_max = bpm_max
         self.is_running = True
+        
+        # SAM3 모드 관련 설정
+        self.roi_mode = roi_mode
+        self.sam3_model = sam3_model
+        self.active_sam3_rois = active_sam3_rois if active_sam3_rois is not None else []
+        self.sam_conf = sam_conf
+        self.sam_min_area = sam_min_area
+
+    def detect_sam3_regions(self, img_rgb, processor, autocast_ctx) -> dict:
+        """
+        주어진 RGB 이미지에서 SAM3를 통해 'tail', 'foot1', 'foot2' 마스크를 반환.
+        """
+        from PIL import Image
+        if img_rgb.dtype == np.uint16:
+            img_8u = (img_rgb / 16.0).clip(0, 255).astype(np.uint8)
+        else:
+            img_8u = img_rgb.astype(np.uint8)
+        pil_image = Image.fromarray(img_8u)
+        
+        import torch
+        res_masks = {}
+        
+        # 1. Image Encoding
+        with autocast_ctx:
+            state = processor.set_image(pil_image)
+            
+        # 2. 'tail' 검출 (최대 1개 blob)
+        if 'tail' in self.active_sam3_rois:
+            with autocast_ctx:
+                state = processor.set_text_prompt(prompt="tail", state=state)
+            masks = state.get("masks")
+            if masks is not None and masks.shape[0] > 0:
+                combined_mask = np.any(masks.cpu().numpy(), axis=0)[0].astype(np.uint8)
+                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(combined_mask)
+                
+                valid_blobs = []
+                for i in range(1, num_labels):
+                    area = stats[i, cv2.CC_STAT_AREA]
+                    if area >= self.sam_min_area:
+                        valid_blobs.append((i, area))
+                
+                if valid_blobs:
+                    valid_blobs.sort(key=lambda x: x[1], reverse=True)
+                    best_label = valid_blobs[0][0]
+                    res_masks['tail'] = (labels == best_label).astype(np.uint8)
+            
+            processor.reset_all_prompts(state)
+            with autocast_ctx:
+                state = processor.set_image(pil_image)
+
+        # 3. 'foot' 검출 (최대 2개 blob, x좌표 순 정렬)
+        if 'foot1' in self.active_sam3_rois or 'foot2' in self.active_sam3_rois:
+            with autocast_ctx:
+                state = processor.set_text_prompt(prompt="foot", state=state)
+            masks = state.get("masks")
+            if masks is not None and masks.shape[0] > 0:
+                combined_mask = np.any(masks.cpu().numpy(), axis=0)[0].astype(np.uint8)
+                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(combined_mask)
+                
+                valid_blobs = []
+                for i in range(1, num_labels):
+                    area = stats[i, cv2.CC_STAT_AREA]
+                    if area >= self.sam_min_area:
+                        cx = centroids[i][0]
+                        valid_blobs.append((i, area, cx))
+                        
+                if valid_blobs:
+                    valid_blobs.sort(key=lambda x: x[1], reverse=True)
+                    top_blobs = valid_blobs[:2]
+                    
+                    if len(top_blobs) == 2:
+                        top_blobs.sort(key=lambda x: x[2]) # x가 작은 순 (왼쪽이 먼저)
+                        res_masks['foot1'] = (labels == top_blobs[0][0]).astype(np.uint8)
+                        res_masks['foot2'] = (labels == top_blobs[1][0]).astype(np.uint8)
+                    else:
+                        # 1개만 검출된 경우 foot1으로 지정
+                        res_masks['foot1'] = (labels == top_blobs[0][0]).astype(np.uint8)
+                        
+        return res_masks
 
     def run(self):
         try:
@@ -76,21 +189,43 @@ class AnalysisWorker(QThread):
                 elif 'IR_Value' in df_sensor_cut.columns:
                     y_sensor = df_sensor_cut['IR_Value'].values
 
-            # 데이터 추출 루프
+            # 데이터 추출 루프 준비
             total_frames = len(df_cam_cut)
             t_cam_list = []
             frame_indices = []
             
-            # shape: [ROI수+배경수, 프레임수, 3(RGB)]
-            roi_count = len(self.rois_info)
-            has_bg = self.bg_roi_info is not None
-            total_regions = roi_count + (1 if has_bg else 0)
-            
-            all_rois = list(self.rois_info)
-            if has_bg:
-                all_rois.append(self.bg_roi_info)
+            # ROI 설정에 따른 변수들 초기화
+            if self.roi_mode == "sam3":
+                # SAM3 전용 변수들
+                roi_names = list(self.active_sam3_rois)
+                roi_count = len(roi_names)
+                has_bg = False
+                total_regions = roi_count
+                
+                # SAM3 Processor 스레드 내 로딩
+                self.progress_signal.emit(5, "SAM3 세그먼테이션 엔진 로드 중...")
+                from sam3.model.sam3_image_processor import Sam3Processor
+                import torch
+                
+                device = "cuda"
+                processor = Sam3Processor(self.sam3_model, device=device, confidence_threshold=self.sam_conf)
+                autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                
+                last_masks = {}
+                warning_messages = []
+            else:
+                # 수동 ROI 전용 변수들
+                roi_names = [f"ROI {i+1}" for i in range(len(self.rois_info))]
+                roi_count = len(self.rois_info)
+                has_bg = self.bg_roi_info is not None
+                total_regions = roi_count + (1 if has_bg else 0)
+                
+                all_rois = list(self.rois_info)
+                if has_bg:
+                    all_rois.append(self.bg_roi_info)
+                warning_messages = []
 
-            # [region_idx][frame_idx][channel(0:R, 1:G, 2:B)]
+            # raw_rgb_data shape: [region_idx][frame_idx][channel(0:R, 1:G, 2:B)]
             raw_rgb_data = np.zeros((total_regions, total_frames, 3), dtype=np.float32)
 
             self.progress_signal.emit(10, f"프레임 데이터 추출 시작 (총 {total_frames} 프레임)")
@@ -110,36 +245,63 @@ class AnalysisWorker(QThread):
 
                 img = tifffile.imread(f_path) if f_path.lower().endswith(('.tiff', '.tif')) else cv2.imread(f_path, cv2.IMREAD_UNCHANGED)
                 
-                # 컬러 변환 (BayerRG12 픽셀 포맷에 맞춤)
+                # 컬러 변환 (BayerRG12 픽셀 포맷 버그 수정 반영: cv2.COLOR_BayerBG2RGB 사용)
                 if len(img.shape) == 2:
-                    # BayerRG to RGB 직접 변환
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BayerRG2RGB)
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BayerBG2RGB)
                 else:
                     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-                for r_idx, (x, y, w, h) in enumerate(all_rois):
-                    # 경계 처리
-                    y_start = max(0, int(y))
-                    y_end = min(img_rgb.shape[0], int(y+h))
-                    x_start = max(0, int(x))
-                    x_end = min(img_rgb.shape[1], int(x+w))
+                if self.roi_mode == "sam3":
+                    # SAM3 각 프레임 세그먼테이션 실행
+                    current_masks = self.detect_sam3_regions(img_rgb, processor, autocast_ctx)
                     
-                    crop = img_rgb[y_start:y_end, x_start:x_end]
-                    # R, G, B 평균 계산
-                    if crop.size > 0:
-                        r_mean = np.mean(crop[:, :, 0])
-                        g_mean = np.mean(crop[:, :, 1])
-                        b_mean = np.mean(crop[:, :, 2])
-                        raw_rgb_data[r_idx, idx, 0] = r_mean
-                        raw_rgb_data[r_idx, idx, 1] = g_mean
-                        raw_rgb_data[r_idx, idx, 2] = b_mean
+                    for r_idx, name in enumerate(roi_names):
+                        mask = current_masks.get(name)
+                        if mask is None or np.sum(mask) == 0:
+                            # 검출 실패 시 직전 프레임 마스크 재사용
+                            if name in last_masks:
+                                mask = last_masks[name]
+                                warning_messages.append(f"Frame {f_idx}: '{name}' 객체가 검출되지 않아 직전 프레임의 영역을 사용했습니다.")
+                            else:
+                                mask = np.zeros(img_rgb.shape[:2], dtype=np.uint8)
+                        
+                        # 검출 성공시 마스크 캐싱
+                        if np.sum(mask) > 0:
+                            last_masks[name] = mask
+                            
+                        # 마스크 영역 내 평균 RGB 추출
+                        if np.sum(mask) > 0:
+                            crop_pixels = img_rgb[mask > 0]
+                            r_mean = np.mean(crop_pixels[:, 0])
+                            g_mean = np.mean(crop_pixels[:, 1])
+                            b_mean = np.mean(crop_pixels[:, 2])
+                            raw_rgb_data[r_idx, idx, 0] = r_mean
+                            raw_rgb_data[r_idx, idx, 1] = g_mean
+                            raw_rgb_data[r_idx, idx, 2] = b_mean
+                else:
+                    # manual 모드 ROI 평균 RGB 추출
+                    for r_idx, (x, y, w, h) in enumerate(all_rois):
+                        # 경계 처리
+                        y_start = max(0, int(y))
+                        y_end = min(img_rgb.shape[0], int(y+h))
+                        x_start = max(0, int(x))
+                        x_end = min(img_rgb.shape[1], int(x+w))
+                        
+                        crop = img_rgb[y_start:y_end, x_start:x_end]
+                        if crop.size > 0:
+                            r_mean = np.mean(crop[:, :, 0])
+                            g_mean = np.mean(crop[:, :, 1])
+                            b_mean = np.mean(crop[:, :, 2])
+                            raw_rgb_data[r_idx, idx, 0] = r_mean
+                            raw_rgb_data[r_idx, idx, 1] = g_mean
+                            raw_rgb_data[r_idx, idx, 2] = b_mean
 
                 t_cam_list.append(f_time)
                 frame_indices.append(f_idx)
 
-                if idx % 10 == 0:
-                    prog = 10 + int(70 * (idx / total_frames))
-                    self.progress_signal.emit(prog, f"추출 중... ({idx}/{total_frames})")
+                if idx % 5 == 0 or idx == total_frames - 1:
+                    prog = 10 + int(85 * (idx / total_frames))
+                    self.progress_signal.emit(prog, f"추출 및 분석 중... ({idx+1}/{total_frames})")
 
             t_cam = np.array(t_cam_list)
             
@@ -153,6 +315,8 @@ class AnalysisWorker(QThread):
                 'raw_rgb_data': raw_rgb_data, # [region_idx, frame_idx, RGB]
                 'frame_indices': frame_indices,
                 'roi_count': roi_count,
+                'roi_names': roi_names,
+                'warning_messages': warning_messages,
                 'has_bg': has_bg,
                 'has_sensor': has_sensor,
                 't_sensor': t_sensor,
@@ -173,6 +337,7 @@ class AnalysisWorker(QThread):
         self.is_running = False
 
 
+
 # =====================================================================
 # 세부 분석 팝업 UI (GraphPopup)
 # =====================================================================
@@ -189,8 +354,16 @@ class GraphPopup(QDialog):
         self.start_frame_idx = start_frame_idx
 
         self.setup_ui()
+        self.update_checkbox_labels()
         if self.analysis_result:
             self.update_graphs()
+
+    def update_checkbox_labels(self):
+        if self.analysis_result and 'roi_names' in self.analysis_result:
+            roi_names = self.analysis_result['roi_names']
+            for i, name in enumerate(roi_names):
+                if i < 3:
+                    self.chks[i].setText(name)
 
     def setup_ui(self):
         main_layout = QVBoxLayout(self)
@@ -303,6 +476,9 @@ class GraphPopup(QDialog):
         low_cut = bpm_min / 60.0
         high_cut = bpm_max / 60.0
 
+        # ROI 이름
+        roi_names = res.get('roi_names', [f"ROI {x+1}" for x in range(roi_count)])
+
         color_roi = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
         color_bg  = (200, 0, 200)
         color_ppg = (200, 200, 200)
@@ -322,7 +498,8 @@ class GraphPopup(QDialog):
                 self.graph_layout.nextRow()
                 p.plot(t_cam_plot, raw_rgb[i, :, ch_idx],
                        pen=pg.mkPen(color_roi[i], width=2))
-                p.setTitle(f"ROI {i+1} Raw [{ch_name}]")
+                # 동적 라벨 사용
+                p.setTitle(f"{roi_names[i]} Raw [{ch_name}]")
                 p.enableAutoRange(axis=pg.ViewBox.YAxis)
                 active_plots.append(p)
 
@@ -392,7 +569,8 @@ class GraphPopup(QDialog):
                 if i < 3 and not self.chks[i].isChecked():
                     continue
                 _plot_filtered(t_cam_plot, raw_rgb[i, :, ch_idx],
-                               fs_cam, color_roi[i], f"ROI {i+1}")
+                               fs_cam, color_roi[i], roi_names[i])
+
 
             # 배경 신호 (체크된 경우)
             if has_bg and self.chk_bg.isChecked():
@@ -746,7 +924,7 @@ class HistPopup(QDialog):
 # 메인 윈도우 UI
 # =====================================================================
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, no_sam3=False):
         super().__init__()
         self.setWindowTitle("rPPG Analysis Tool")
         self.resize(1400, 900)
@@ -768,6 +946,13 @@ class MainWindow(QMainWindow):
         
         self.analysis_result = None  # Worker에서 받은 결과 저장
         self.graph_popup = None       # 상세 그래프 팝업 인스턴스
+
+        # SAM3 관련 속성
+        self.no_sam3_arg = no_sam3
+        self.has_sam3 = try_import_sam3(force_no=no_sam3)
+        self.sam3_model = None
+        self.sam3_processor = None
+        self.autocast_ctx = None
 
         self.play_timer = QTimer()
         self.play_timer.timeout.connect(self.play_next_frame)
@@ -877,24 +1062,89 @@ class MainWindow(QMainWindow):
         # 분석 설정
         group_settings = QGroupBox("분석 설정")
         set_layout = QVBoxLayout()
+
+        # ROI 설정 모드
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("ROI 모드:"))
+        self.combo_roi_mode = QComboBox()
+        self.combo_roi_mode.addItems(["ROI 직접설정", "SAM3 세그먼테이션"])
+        mode_layout.addWidget(self.combo_roi_mode)
+        set_layout.addLayout(mode_layout)
+        self.combo_roi_mode.currentIndexChanged.connect(self.on_roi_mode_changed)
+
+        # --- 4-1. ROI 직접설정 설정 위젯 ---
+        self.widget_manual_settings = QWidget()
+        manual_layout = QVBoxLayout(self.widget_manual_settings)
+        manual_layout.setContentsMargins(0, 0, 0, 0)
         
-        # ROI 개수
         roi_layout = QHBoxLayout()
         roi_layout.addWidget(QLabel("ROI 개수:"))
         self.spin_roi_count = QSpinBox()
         self.spin_roi_count.setRange(1, 3)
         self.spin_roi_count.setValue(3)
         roi_layout.addWidget(self.spin_roi_count)
-        set_layout.addLayout(roi_layout)
+        manual_layout.addLayout(roi_layout)
 
-        # 배경 유무
         bg_layout = QHBoxLayout()
         bg_layout.addWidget(QLabel("배경 영역:"))
         self.spin_bg_count = QSpinBox()
         self.spin_bg_count.setRange(0, 1)
         self.spin_bg_count.setValue(1)
         bg_layout.addWidget(self.spin_bg_count)
-        set_layout.addLayout(bg_layout)
+        manual_layout.addLayout(bg_layout)
+
+        self.btn_setup = QPushButton("설정 완료")
+        self.btn_setup.setCheckable(True)
+        self.btn_setup.clicked.connect(self.toggle_setup)
+        manual_layout.addWidget(self.btn_setup)
+        
+        set_layout.addWidget(self.widget_manual_settings)
+
+        # --- 4-2. SAM3 세그먼테이션 설정 위젯 ---
+        self.widget_sam3_settings = QWidget()
+        sam3_layout = QVBoxLayout(self.widget_sam3_settings)
+        sam3_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.btn_segment = QPushButton("세그먼테이션")
+        self.btn_segment.clicked.connect(self.run_sam3_preview)
+        sam3_layout.addWidget(self.btn_segment)
+
+        chk_layout = QHBoxLayout()
+        self.chk_sam_tail = QCheckBox("tail")
+        self.chk_sam_foot1 = QCheckBox("foot1")
+        self.chk_sam_foot2 = QCheckBox("foot2")
+        self.chk_sam_tail.setChecked(True)
+        self.chk_sam_foot1.setChecked(True)
+        self.chk_sam_foot2.setChecked(True)
+        chk_layout.addWidget(self.chk_sam_tail)
+        chk_layout.addWidget(self.chk_sam_foot1)
+        chk_layout.addWidget(self.chk_sam_foot2)
+        sam3_layout.addLayout(chk_layout)
+
+        conf_layout = QHBoxLayout()
+        conf_layout.addWidget(QLabel("임계값:"))
+        self.spin_sam_conf = QDoubleSpinBox()
+        self.spin_sam_conf.setRange(0.1, 1.0)
+        self.spin_sam_conf.setValue(0.3)
+        self.spin_sam_conf.setSingleStep(0.05)
+        conf_layout.addWidget(self.spin_sam_conf)
+        sam3_layout.addLayout(conf_layout)
+
+        area_layout = QHBoxLayout()
+        area_layout.addWidget(QLabel("최소 크기:"))
+        self.spin_sam_min_area = QSpinBox()
+        self.spin_sam_min_area.setRange(5, 10000)
+        self.spin_sam_min_area.setValue(100)
+        area_layout.addWidget(self.spin_sam_min_area)
+        sam3_layout.addLayout(area_layout)
+
+        set_layout.addWidget(self.widget_sam3_settings)
+        self.widget_sam3_settings.setVisible(False) # 기본값은 숨김
+
+        # SAM3 사용 불가할 시 UI 비활성화
+        if not self.has_sam3:
+            self.combo_roi_mode.setEnabled(False)
+            self.combo_roi_mode.setToolTip("GPU 환경이 구축되지 않았거나 SAM3 패키지가 설치되지 않았습니다.")
 
         # 분석 시간
         time_layout = QHBoxLayout()
@@ -920,10 +1170,6 @@ class MainWindow(QMainWindow):
         bpm_layout.addWidget(QLabel("~"))
         bpm_layout.addWidget(self.spin_bpm_max)
         set_layout.addLayout(bpm_layout)
-
-        self.btn_setup = QPushButton("설정 완료")
-        self.btn_setup.setCheckable(True)
-        set_layout.addWidget(self.btn_setup)
         
         group_settings.setLayout(set_layout)
         center_layout.addWidget(group_settings)
@@ -1271,7 +1517,11 @@ class MainWindow(QMainWindow):
         self.remove_roi_boxes()
         self.btn_setup.setChecked(False)
         self.btn_setup.setText("설정 완료")
-        self.btn_analyze.setEnabled(False)
+        
+        # SAM3 모드인지 확인하여 분석 시작 버튼 활성화 여부 조절
+        is_sam3 = (self.combo_roi_mode.currentIndex() == 1)
+        self.btn_analyze.setEnabled(is_sam3)
+        
         self.btn_analyze.setText("분석 시작")
         self.progress_bar.setValue(0)
         self.lbl_status.setText("준비됨")
@@ -1283,25 +1533,212 @@ class MainWindow(QMainWindow):
             p.clear()
 
     # -----------------------------------------------------------------
+    # SAM3 세그먼테이션 지원 메서드
+    # -----------------------------------------------------------------
+    def on_roi_mode_changed(self, index):
+        is_sam3 = (index == 1)
+        self.widget_manual_settings.setVisible(not is_sam3)
+        self.widget_sam3_settings.setVisible(is_sam3)
+        
+        if is_sam3:
+            # 수동 ROI 박스 제거
+            self.remove_roi_boxes()
+            self.btn_setup.setChecked(False)
+            self.btn_setup.setText("설정 완료")
+            self.btn_analyze.setEnabled(True)
+        else:
+            self.btn_analyze.setEnabled(self.btn_setup.isChecked())
+
+    def get_sam3_processor(self):
+        if self.sam3_processor is None:
+            self.lbl_status.setText("SAM3 모델 로딩 중...")
+            QApplication.processEvents()
+            
+            import torch
+            self.autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            
+            self.sam3_model = sam3_model_builder(
+                device="cuda",
+                eval_mode=True,
+                load_from_HF=True,
+            )
+            self.sam3_processor = Sam3Processor(self.sam3_model, device="cuda", confidence_threshold=0.3)
+            self.lbl_status.setText("SAM3 로드 완료")
+        return self.sam3_processor
+
+    def run_sam3_preview(self):
+        if not self.folder_path:
+            QMessageBox.warning(self, "경고", "먼저 폴더를 선택하세요.")
+            return
+
+        f_idx = self.current_frame_idx
+        f_path = os.path.join(self.frames_dir, f"frame_{f_idx:04d}.tiff")
+        if not os.path.exists(f_path):
+            f_path = os.path.join(self.frames_dir, f"frame_{f_idx:04d}.tif")
+            if not os.path.exists(f_path):
+                QMessageBox.warning(self, "경고", f"프레임 {f_idx} 파일을 찾을 수 없습니다.")
+                return
+
+        self.lbl_status.setText("SAM3 세그먼테이션 추론 중...")
+        QApplication.processEvents()
+
+        # 이미지 읽기 (BayerRG12 버그 수정 반영: cv2.COLOR_BayerBG2RGB)
+        img = tifffile.imread(f_path) if f_path.lower().endswith(('.tiff', '.tif')) else cv2.imread(f_path, cv2.IMREAD_UNCHANGED)
+        if len(img.shape) == 2:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BayerBG2RGB)
+        else:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        if img_rgb.dtype == np.uint16:
+            img_rgb = (img_rgb / 16.0).clip(0, 255).astype(np.uint8)
+
+        try:
+            processor = self.get_sam3_processor()
+            if processor is None:
+                raise Exception("SAM3 모델 로드 실패 (CUDA 장치 또는 Hugging Face 상태 확인 필요)")
+
+            conf_val = self.spin_sam_conf.value()
+            min_area_val = self.spin_sam_min_area.value()
+            processor.confidence_threshold = conf_val
+
+            from PIL import Image
+            pil_image = Image.fromarray(img_rgb)
+
+            # state 초기화 및 인코딩
+            with self.autocast_ctx:
+                state = processor.set_image(pil_image)
+
+            # tail
+            tail_mask = None
+            if self.chk_sam_tail.isChecked():
+                with self.autocast_ctx:
+                    state = processor.set_text_prompt(prompt="tail", state=state)
+                masks = state.get("masks")
+                if masks is not None and masks.shape[0] > 0:
+                    combined_mask = np.any(masks.cpu().numpy(), axis=0)[0].astype(np.uint8)
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(combined_mask)
+                    valid_blobs = []
+                    for i in range(1, num_labels):
+                        area = stats[i, cv2.CC_STAT_AREA]
+                        if area >= min_area_val:
+                            valid_blobs.append((i, area))
+                    if valid_blobs:
+                        valid_blobs.sort(key=lambda x: x[1], reverse=True)
+                        best_label = valid_blobs[0][0]
+                        tail_mask = (labels == best_label).astype(np.uint8)
+
+            processor.reset_all_prompts(state)
+            with self.autocast_ctx:
+                state = processor.set_image(pil_image)
+
+            # foot (최대 2개)
+            foot1_mask = None
+            foot2_mask = None
+            if self.chk_sam_foot1.isChecked() or self.chk_sam_foot2.isChecked():
+                with self.autocast_ctx:
+                    state = processor.set_text_prompt(prompt="foot", state=state)
+                masks = state.get("masks")
+                if masks is not None and masks.shape[0] > 0:
+                    combined_mask = np.any(masks.cpu().numpy(), axis=0)[0].astype(np.uint8)
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(combined_mask)
+                    valid_blobs = []
+                    for i in range(1, num_labels):
+                        area = stats[i, cv2.CC_STAT_AREA]
+                        if area >= min_area_val:
+                            cx = centroids[i][0]
+                            valid_blobs.append((i, area, cx))
+                    if valid_blobs:
+                        valid_blobs.sort(key=lambda x: x[1], reverse=True)
+                        top_blobs = valid_blobs[:2]
+                        if len(top_blobs) == 2:
+                            top_blobs.sort(key=lambda x: x[2])
+                            foot1_mask = (labels == top_blobs[0][0]).astype(np.uint8)
+                            foot2_mask = (labels == top_blobs[1][0]).astype(np.uint8)
+                        else:
+                            foot1_mask = (labels == top_blobs[0][0]).astype(np.uint8)
+
+            # 오버레이 이미지 합성
+            overlay_img = img_rgb.copy()
+            alpha = 0.40
+            labels_info = []
+
+            # tail: 초록색 (60, 200, 60)
+            if tail_mask is not None and np.sum(tail_mask) > 0 and self.chk_sam_tail.isChecked():
+                overlay_img[tail_mask > 0] = (60, 200, 60)
+                cy, cx = np.where(tail_mask > 0)
+                labels_info.append(("tail", (int(np.mean(cx)), int(np.mean(cy)))))
+
+            # foot1: 빨간색 (255, 60, 60)
+            if foot1_mask is not None and np.sum(foot1_mask) > 0 and self.chk_sam_foot1.isChecked():
+                overlay_img[foot1_mask > 0] = (255, 60, 60)
+                cy, cx = np.where(foot1_mask > 0)
+                labels_info.append(("foot1", (int(np.mean(cx)), int(np.mean(cy)))))
+
+            # foot2: 주황색 (255, 150, 50)
+            if foot2_mask is not None and np.sum(foot2_mask) > 0 and self.chk_sam_foot2.isChecked():
+                overlay_img[foot2_mask > 0] = (255, 150, 50)
+                cy, cx = np.where(foot2_mask > 0)
+                labels_info.append(("foot2", (int(np.mean(cx)), int(np.mean(cy)))))
+
+            preview_rgb = cv2.addWeighted(overlay_img, alpha, img_rgb, 1 - alpha, 0)
+
+            # 텍스트 라벨 렌더링
+            for text, pos in labels_info:
+                tx, ty = pos
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(preview_rgb, (tx - 5, ty - th - 5), (tx + tw + 5, ty + 5), (0, 0, 0), -1)
+                cv2.putText(preview_rgb, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+            img_pg = np.transpose(preview_rgb, (1, 0, 2))
+            levels = (0, 255) if preview_rgb.dtype == np.uint8 else (0, 4095)
+            self.image_view.setImage(img_pg, autoRange=False, autoLevels=False, levels=levels)
+
+            self.lbl_status.setText("세그먼테이션 미리보기 완료")
+
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"세그먼테이션 중 오류 발생:\n{str(e)}")
+            self.lbl_status.setText("세그먼테이션 오류")
+
+    # -----------------------------------------------------------------
     # 분석 시작
     # -----------------------------------------------------------------
     def start_analysis(self):
         if self.btn_analyze.text() == "분석중":
             return # 이미 실행중
-        
-        # ROI 정보 추출 [x, y, w, h]
-        # pyqtgraph 좌표는 이미지의 transpose된 좌표이므로 (x, y) 그대로 사용하면 됨
+
+        roi_mode = "manual"
+        active_sam3_rois = []
         rois_info = []
-        for roi in self.roi_items:
-            pos = roi.pos()
-            size = roi.size()
-            rois_info.append((pos[0], pos[1], size[0], size[1]))
-            
         bg_roi_info = None
-        if self.bg_roi_item:
-            pos = self.bg_roi_item.pos()
-            size = self.bg_roi_item.size()
-            bg_roi_info = (pos[0], pos[1], size[0], size[1])
+
+        if self.combo_roi_mode.currentIndex() == 1:
+            # SAM3 세그먼테이션 모드
+            roi_mode = "sam3"
+            if self.chk_sam_tail.isChecked():
+                active_sam3_rois.append('tail')
+            if self.chk_sam_foot1.isChecked():
+                active_sam3_rois.append('foot1')
+            if self.chk_sam_foot2.isChecked():
+                active_sam3_rois.append('foot2')
+
+            if not active_sam3_rois:
+                QMessageBox.warning(self, "경고", "분석할 SAM3 ROI 영역을 적어도 하나 이상 체크하세요.")
+                return
+
+            # 분석 전에 SAM3 모델 로드 보장
+            self.get_sam3_processor()
+        else:
+            # 수동 ROI 직접설정 모드
+            roi_mode = "manual"
+            for roi in self.roi_items:
+                pos = roi.pos()
+                size = roi.size()
+                rois_info.append((pos[0], pos[1], size[0], size[1]))
+                
+            if self.bg_roi_item:
+                pos = self.bg_roi_item.pos()
+                size = self.bg_roi_item.size()
+                bg_roi_info = (pos[0], pos[1], size[0], size[1])
 
         bpm_min = self.spin_bpm_min.value()
         bpm_max = self.spin_bpm_max.value()
@@ -1316,7 +1753,11 @@ class MainWindow(QMainWindow):
         # QThread 시작
         self.worker = AnalysisWorker(
             self.folder_path, self.current_frame_idx, duration,
-            rois_info, bg_roi_info, bpm_min, bpm_max
+            rois_info, bg_roi_info, bpm_min, bpm_max,
+            roi_mode=roi_mode, sam3_model=self.sam3_model,
+            active_sam3_rois=active_sam3_rois,
+            sam_conf=self.spin_sam_conf.value(),
+            sam_min_area=self.spin_sam_min_area.value()
         )
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.finished_signal.connect(self.analysis_finished)
@@ -1338,9 +1779,23 @@ class MainWindow(QMainWindow):
         self.btn_graph_popup.setEnabled(True)
         self.lbl_status.setText("분석 완료")
 
+        # 경고 문구가 있으면 QMessageBox로 요약하여 안내
+        warnings = result.get('warning_messages', [])
+        if warnings:
+            unique_warnings = {}
+            for w in warnings:
+                parts = w.split(":")
+                if len(parts) >= 2:
+                    msg = parts[1].strip()
+                    unique_warnings[msg] = unique_warnings.get(msg, 0) + 1
+            
+            warning_text = "\n".join([f"- {msg} (총 {count}회)" for msg, count in unique_warnings.items()])
+            QMessageBox.warning(self, "검출 실패 경고", f"분석 중 일부 프레임에서 객체 검출에 실패하여 직전 영역을 사용했습니다:\n\n{warning_text}")
+
         # 팝업이 열려 있으면 새 결과로 자동 갱신
         if self.graph_popup is not None and self.graph_popup.isVisible():
             self.graph_popup.analysis_result = result
+            self.graph_popup.update_checkbox_labels()
             self.graph_popup.update_graphs()
 
         # 최초 기본 채널(R) 그래프 표시
@@ -1412,6 +1867,9 @@ class MainWindow(QMainWindow):
         low_cut = bpm_min / 60.0
         high_cut = bpm_max / 60.0
 
+        # ROI 이름
+        roi_names = res.get('roi_names', [f"ROI {x+1}" for x in range(roi_count)])
+
         plot_colors = [(255,0,0), (0,255,0), (0,0,255)]
 
         # 기존 플롯들 초기화 및 레이아웃 정리
@@ -1429,7 +1887,8 @@ class MainWindow(QMainWindow):
                 self.graph_layout.nextRow()
                 y_raw = raw_rgb[i, :, ch_idx]
                 p.plot(t_cam_plot, y_raw, pen=pg.mkPen(plot_colors[i], width=2))
-                p.setTitle(f"ROI {i+1} Raw [{ch_name}]")
+                # 동적 ROI 타이틀 반영
+                p.setTitle(f"{roi_names[i]} Raw [{ch_name}]")
                 p.enableAutoRange()
                 active_plots.append(p)
 
@@ -1453,7 +1912,8 @@ class MainWindow(QMainWindow):
                 
                 bpm = 60.0 / np.mean(np.diff(t_cam[peaks])) if len(peaks) > 1 else 0
                 
-                p_filt.plot(t_cam_plot, y_filt, pen=pg.mkPen(plot_colors[i], width=2), name=f"ROI {i+1} (BPM: {bpm:.1f})")
+                # 동적 ROI 범례 반영
+                p_filt.plot(t_cam_plot, y_filt, pen=pg.mkPen(plot_colors[i], width=2), name=f"{roi_names[i]} (BPM: {bpm:.1f})")
                 
                 # Peaks scatter
                 if len(peaks) > 0:
@@ -1538,14 +1998,17 @@ class MainWindow(QMainWindow):
 
         fps = res['fs_cam']
 
+        # ROI 이름 목록 가져오기
+        roi_names = res.get('roi_names', [f"roi{x+1}" for x in range(roi_count)])
+
         rows = []
         for i, f_idx in enumerate(frame_indices):
             save_f_idx = i + 1
-            # ROI 1~3
+            # ROI 1~3 (동적 이름 사용)
             for r in range(roi_count):
                 rows.append({
                     "Frame": save_f_idx,
-                    "Type": f"roi{r+1}",
+                    "Type": roi_names[r],
                     "R": raw_rgb[r, i, 0],
                     "G": raw_rgb[r, i, 1],
                     "B": raw_rgb[r, i, 2],
@@ -1571,7 +2034,11 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     import sys
+    no_sam3 = "--no-sam3" in sys.argv
+    if no_sam3:
+        sys.argv.remove("--no-sam3")
+    
     app = QApplication(sys.argv)
-    window = MainWindow()
+    window = MainWindow(no_sam3=no_sam3)
     window.show()
     sys.exit(app.exec())
