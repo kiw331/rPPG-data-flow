@@ -275,7 +275,7 @@ class PPGGapViewer(QMainWindow):
             pk0, _ = find_peaks(ss, distance=mind_boot, prominence=prom)
             if len(pk0) < 2:
                 vl0, _ = find_peaks(-ss, distance=mind_boot, prominence=prom)
-                return pk0, vl0, False, False
+                return pk0, vl0, False, False, []
             avg_T = np.median(np.diff(ts[pk0]))
 
             # ── Step 2: 본 탐지 — 최소 간격 0.6×avg_T (한 파형 이중 탐지 방지) ──
@@ -283,7 +283,7 @@ class PPGGapViewer(QMainWindow):
             pk, _ = find_peaks( ss, distance=mind, prominence=prom)
             vl, _ = find_peaks(-ss, distance=mind, prominence=prom)
             if len(pk) < 2:
-                return pk, vl, False, False
+                return pk, vl, False, False, []
 
             avg_T = np.median(np.diff(ts[pk]))   # 재계산
 
@@ -360,22 +360,49 @@ class PPGGapViewer(QMainWindow):
             forced_head = forced_tail = False
 
             # ── Step 3: 첫 피크 위치 검증 ──
-            # 라벨 시작(골)에서 avg_T 이내에 첫 피크가 없으면 재탐색 후 주기 강제
+            # 라벨 시작(골)에서 avg_T 이내에 첫 피크가 없으면 재탐색
+            # 실제 피크가 발견되면 pk에 추가, 없으면 강제 피크를 만들지 않고 보간에 맡김
             if ts[pk[0]] > seg_start + edge_r:
                 new = _edge_search(seg_start, seg_start + edge_r)
-                if not len(new):
-                    new = _period_forced(ts[pk[0]], direction=-1)
-                    forced_head = True
-                pk = np.sort(np.unique(np.append(pk, new)))
+                if len(new):
+                    pk = np.sort(np.unique(np.append(pk, new)))
+                else:
+                    forced_head = True  # 보간으로 처리
 
             # ── Step 4: 끝 피크 위치 검증 ──
-            # 라벨 종료(골)에서 avg_T 이내에 끝 피크가 없으면 재탐색 후 주기 강제
+            # 라벨 종료(골)에서 avg_T 이내에 끝 피크가 없으면 재탐색
             if ts[pk[-1]] < seg_end - edge_r:
                 new = _edge_search(seg_end - edge_r, seg_end)
-                if not len(new):
-                    new = _period_forced(ts[pk[-1]], direction=+1)
-                    forced_tail = True
-                pk = np.sort(np.unique(np.append(pk, new)))
+                if len(new):
+                    pk = np.sort(np.unique(np.append(pk, new)))
+                else:
+                    forced_tail = True  # 보간으로 처리
+            # ── Step 5: 피크-골 교대성(Alternation) 검증 및 단축 ──
+            # 피크와 골이 번갈아 나타나지 않는 왜곡이 발생하면, 위반 시점 이후를 잘라내고 보간으로 대체합니다.
+            events = []
+            for p in pk:
+                events.append((ts[p], 1, p))   # 피크는 1
+            for v in vl:
+                events.append((ts[v], -1, v))  # 골은 -1
+            events.sort(key=lambda x: x[0])
+
+            valid_events = []
+            last_type = None
+            truncated = False
+
+            for i, ev in enumerate(events):
+                t_ev, type_ev, idx_ev = ev
+                if last_type is not None and type_ev == last_type:
+                    # 연속해서 같은 타입(피크-피크 또는 골-골)이 나타나면 왜곡이 시작된 것이므로 단축
+                    truncated = True
+                    break
+                valid_events.append(ev)
+                last_type = type_ev
+
+            if truncated:
+                pk = np.array([ev[2] for ev in valid_events if ev[1] == 1], dtype=int)
+                vl = np.array([ev[2] for ev in valid_events if ev[1] == -1], dtype=int)
+                forced_tail = False  # 단축되었으므로 끝단 강제 피크는 해제함
 
             return pk, vl, forced_head, forced_tail, interior_syn
 
@@ -391,7 +418,7 @@ class PPGGapViewer(QMainWindow):
             denom = np.where(upper - lower < 1e-9, 1e-9, upper - lower)
             return np.clip(2.0 * (sr - lower) / denom - 1.0, -1.0, 1.0)
 
-        def gen_synth(tg, T_start, T_end=None, valley_ref=-1.0):
+        def gen_synth(tg, T_start, T_end=None, start_type='peak', end_type='peak', valley_ref=-1.0):
             # T_start: period at gap start (matches preceding real segment boundary)
             # T_end:   period at gap end   (matches following real segment boundary)
             # phase varies smoothly so d_phi/dt = 2pi/T(t) with T(t) linearly varying
@@ -399,11 +426,21 @@ class PPGGapViewer(QMainWindow):
                 T_end = T_start
             dur = tg[-1] - tg[0]
             if dur <= 0 or len(tg) < 2:
-                return np.full(len(tg), 1.0)
+                val = 1.0 if start_type == 'peak' else valley_ref
+                return np.full(len(tg), val)
 
             # Harmonic-mean period → integer cycle count
             T_hmean = 2 * T_start * T_end / (T_start + T_end)
-            n_cyc   = max(1, round(dur / T_hmean))
+            
+            # 목표 총 위상 변화량 delta_phi 결정
+            if start_type == end_type:
+                n_cyc = max(1, round(dur / T_hmean))
+                delta_phi = 2 * np.pi * n_cyc
+            else:
+                n_half = max(1, round(2 * (dur / T_hmean) - 1)) # 홀수 배의 반주기 개수
+                if n_half % 2 == 0:
+                    n_half += 1
+                delta_phi = np.pi * n_half
 
             # Angular frequencies at each end
             w0    = 2 * np.pi / T_start
@@ -414,13 +451,18 @@ class PPGGapViewer(QMainWindow):
             phi_raw   = dur * (w0 * alpha + (w1 - w0) * alpha ** 2 / 2)
             phi_total = phi_raw[-1]              # = dur*(w0+w1)/2
 
-            # Rescale so phi spans exactly 2pi*n_cyc → both endpoints at cos = +1
-            scale = (2 * np.pi * n_cyc) / phi_total if phi_total > 0 else 1.0
+            # Rescale so phi spans exactly delta_phi
+            scale = delta_phi / phi_total if phi_total > 0 else 1.0
             phi   = phi_raw * scale
+
+            if start_type == 'peak':
+                y = np.cos(phi)
+            else:
+                y = -np.cos(phi)
 
             mid = (1.0 + valley_ref) / 2
             amp = (1.0 - valley_ref) / 2
-            return mid + amp * np.cos(phi)
+            return mid + amp * y
 
         # ── 세그먼트 처리 ──
         segs = []
@@ -464,18 +506,15 @@ class PPGGapViewer(QMainWindow):
             for t0, t1 in interior_syn:
                 _replace_syn(t0, t1)
 
-            # 끝단 강제 피크: 마지막 실 피크 ~ 강제 피크 구간 교체
-            if forced_tail and len(pkr) >= 2:
-                _replace_syn(ts[pkr[-2]], ts[pkr[-1]])
-
-            # 앞단 강제 피크: 강제 피크 ~ 첫 실 피크 구간 교체
-            if forced_head and len(pkr) >= 2:
-                _replace_syn(ts[pkr[0]], ts[pkr[1]])
-
             pk_ivl      = np.diff(ts[pkr])
+            period_mid  = float(np.median(pk_ivl)) if len(pk_ivl) else 0.15
             N_loc       = min(3, len(pk_ivl))
-            period_head = float(np.mean(pk_ivl[:N_loc]))
-            period_tail = float(np.mean(pk_ivl[-N_loc:]))
+            raw_head    = float(np.mean(pk_ivl[:N_loc])) if len(pk_ivl) else period_mid
+            raw_tail    = float(np.mean(pk_ivl[-N_loc:])) if len(pk_ivl) else period_mid
+            
+            # 국소 노이즈로 인해 주기가 늘어나거나 줄어드는 왜곡을 막기 위해 대표 주기(중앙값)의 85%~115% 범위로 클램핑
+            period_head = np.clip(raw_head, 0.85 * period_mid, 1.15 * period_mid)
+            period_tail = np.clip(raw_tail, 0.85 * period_mid, 1.15 * period_mid)
 
             segs.append({
                 "t":           tr,
@@ -485,6 +524,8 @@ class PPGGapViewer(QMainWindow):
                 "period_tail": period_tail,   # local period near segment end
                 "t_s":         tlo,
                 "t_e":         thi,
+                "label_start": s,
+                "label_end":   e,
             })
 
         valid = [s for s in segs if s is not None]
@@ -495,23 +536,41 @@ class PPGGapViewer(QMainWindow):
         filled = np.zeros(n, bool)
         is_syn = np.zeros(n, bool)
 
+        # 1. 세그먼트 내부 영역 채우기 (실신호 및 피크 감지 실패로 인한 앞/뒤 보간)
         for seg in valid:
-            m = (t >= seg["t_s"]) & (t <= seg["t_e"])
-            sig_rc[m] = np.interp(t[m], seg["t"], seg["sig"])
-            filled[m] = True
+            # 실신호 구간 (첫 피크 ~ 마지막 피크)
+            m_real = (t >= seg["t_s"]) & (t <= seg["t_e"])
+            sig_rc[m_real] = np.interp(t[m_real], seg["t"], seg["sig"])
+            filled[m_real] = True
 
+            # 앞단 보간 (원래 시작 골 ~ 첫 피크)
+            if seg["t_s"] > seg["label_start"]:
+                m_head = (t >= seg["label_start"]) & (t < seg["t_s"])
+                if m_head.sum() >= 2:
+                    sig_rc[m_head] = gen_synth(t[m_head], seg["period_head"], start_type='valley', end_type='peak')
+                    filled[m_head] = True
+                    is_syn[m_head] = True
+
+            # 뒷단 보간 (마지막 피크 ~ 원래 끝 골)
+            if seg["label_end"] > seg["t_e"]:
+                m_tail = (t > seg["t_e"]) & (t <= seg["label_end"])
+                if m_tail.sum() >= 2:
+                    sig_rc[m_tail] = gen_synth(t[m_tail], seg["period_tail"], start_type='peak', end_type='valley')
+                    filled[m_tail] = True
+                    is_syn[m_tail] = True
+
+        # 2. 세그먼트 간 순수 갭 영역 채우기 (이전 끝 골 ~ 다음 시작 골)
         for i in range(len(valid) - 1):
             a, b    = valid[i], valid[i + 1]
-            gs, ge  = a["t_e"], b["t_s"]
+            gs, ge  = a["label_end"], b["label_start"]
             if ge <= gs:
                 continue
-            # Use local period at each boundary for smooth frequency continuity
-            T_start = a["period_tail"]   # period just before the gap
-            T_end   = b["period_head"]   # period just after the gap
+            T_start = a["period_tail"]
+            T_end   = b["period_head"]
             m_gap   = (t > gs) & (t < ge)
             if m_gap.sum() < 2:
                 continue
-            sig_rc[m_gap] = gen_synth(t[m_gap], T_start, T_end)
+            sig_rc[m_gap] = gen_synth(t[m_gap], T_start, T_end, start_type='valley', end_type='valley')
             filled[m_gap] = True
             is_syn[m_gap] = True
 
