@@ -7,6 +7,8 @@ human/*
 setting/*
 output/*
 
+unused/*
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
