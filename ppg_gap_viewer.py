@@ -315,15 +315,22 @@ class PPGGapViewer(QMainWindow):
             return filtfilt(b, a, sig)
 
         def proc_iso(s, e):
-            sp = max(t[0], s - PAD_SEC)
-            ep = min(t[-1], e + PAD_SEC)
-            m  = (t >= sp) & (t <= ep)
-            te, se = t[m], sig_raw[m].copy()
-            ma_n   = max(3, int(MA_WIN_SEC * fs))
-            sdt    = se - uniform_filter1d(se, ma_n)
-            sbf    = bpf(sdt)
-            inner  = (te >= s) & (te <= e)
-            return te[inner], sbf[inner]
+            m_inner = (t >= s) & (t <= e)
+            t_inner = t[m_inner]
+            s_inner = sig_raw[m_inner].copy()
+            if len(s_inner) < 3:
+                return t_inner, s_inner
+
+            pad_len = int(PAD_SEC * fs)
+            # 신호의 급격한 경계면(갭과의 경계)에서 발생하는 필터 과도 현상(ringing)을 방지하기 위해 'edge' 패딩 적용
+            se_padded = np.pad(s_inner, pad_width=pad_len, mode='edge')
+            
+            ma_n = max(3, int(MA_WIN_SEC * fs))
+            sdt_padded = se_padded - uniform_filter1d(se_padded, ma_n)
+            sbf_padded = bpf(sdt_padded)
+            
+            sbf_inner = sbf_padded[pad_len:-pad_len]
+            return t_inner, sbf_inner
 
         def detect(ts, ss, seg_start, seg_end):
             prom      = ss.std() * PEAK_PROM
@@ -625,9 +632,9 @@ class PPGGapViewer(QMainWindow):
 
             pk_ivl      = np.diff(ts[pkr])
             period_mid  = float(np.median(pk_ivl)) if len(pk_ivl) else 0.15
-            N_loc       = min(3, len(pk_ivl))
-            raw_head    = float(np.mean(pk_ivl[:N_loc])) if len(pk_ivl) else period_mid
-            raw_tail    = float(np.mean(pk_ivl[-N_loc:])) if len(pk_ivl) else period_mid
+            N_loc       = min(5, len(pk_ivl))
+            raw_head    = float(np.median(pk_ivl[:N_loc])) if len(pk_ivl) else period_mid
+            raw_tail    = float(np.median(pk_ivl[-N_loc:])) if len(pk_ivl) else period_mid
             
             # 국소 노이즈로 인해 주기가 늘어나거나 줄어드는 왜곡을 막기 위해 대표 주기(중앙값)의 85%~115% 범위로 클램핑
             period_head = np.clip(raw_head, 0.85 * period_mid, 1.15 * period_mid)
