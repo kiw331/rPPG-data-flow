@@ -640,16 +640,28 @@ class PPGGapViewer(QMainWindow):
             period_head = np.clip(raw_head, 0.85 * period_mid, 1.15 * period_mid)
             period_tail = np.clip(raw_tail, 0.85 * period_mid, 1.15 * period_mid)
 
+            T_seg = float(np.median(pk_ivl)) if len(pk_ivl) else 0.15
+
+            # ── 경계 부근 골(Valley) 이상치 보정 ──
+            # 이상치 기준: 첫/마지막 피크와 라벨 경계(골) 사이의 간격이 0.25T 미만이거나 0.75T 초과인 경우
+            s_corr = s
+            if tlo - s < 0.25 * T_seg or tlo - s > 0.75 * T_seg:
+                s_corr = tlo - 0.5 * T_seg
+
+            e_corr = e
+            if e - thi < 0.25 * T_seg or e - thi > 0.75 * T_seg:
+                e_corr = thi + 0.5 * T_seg
+
             segs.append({
                 "t":           tr,
                 "sig":         sn,
-                "period":      float(np.median(pk_ivl)),
+                "period":      T_seg,
                 "period_head": period_head,   # local period near segment start
                 "period_tail": period_tail,   # local period near segment end
                 "t_s":         tlo,
                 "t_e":         thi,
-                "label_start": s,
-                "label_end":   e,
+                "label_start": s_corr,
+                "label_end":   e_corr,
             })
 
         valid = [s for s in segs if s is not None]

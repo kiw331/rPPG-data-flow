@@ -85,14 +85,22 @@ class SegmentLabelerApp(QMainWindow):
         top.addWidget(self.btn_next)
         outer.addLayout(top)
 
-        # 상태/채널/샘플레이트
+        # 상태/보기채널/저장지정채널/샘플레이트
         info = QHBoxLayout()
-        info.addWidget(QLabel("채널:"))
+        info.addWidget(QLabel("보기 채널:"))
         self.combo_channel = QComboBox()
         self.combo_channel.addItems(["IR", "RED"])
         self.combo_channel.currentTextChanged.connect(self.redraw_plot)
         info.addWidget(self.combo_channel)
         info.addSpacing(20)
+        
+        info.addWidget(QLabel("저장 지정 채널:"))
+        self.combo_save_channel = QComboBox()
+        self.combo_save_channel.addItems(["IR", "RED"])
+        self.combo_save_channel.setCurrentIndex(0) # 기본 IR
+        info.addWidget(self.combo_save_channel)
+        info.addSpacing(20)
+        
         info.addWidget(QLabel("Sampling Rate (Hz):"))
         self.spin_fs = QDoubleSpinBox()
         self.spin_fs.setRange(1, 5000); self.spin_fs.setDecimals(0); self.spin_fs.setValue(SAMPLE_RATE_DEFAULT)
@@ -377,6 +385,20 @@ class SegmentLabelerApp(QMainWindow):
             return
         if 'start_time' not in df.columns or 'end_time' not in df.columns:
             return
+            
+        # 저장 채널값 복원 (있을 경우)
+        if 'channel' in df.columns and len(df) > 0:
+            saved_ch = str(df['channel'].iloc[0]).upper()
+            if saved_ch in ["IR", "RED"]:
+                self.combo_save_channel.blockSignals(True)
+                self.combo_save_channel.setCurrentText(saved_ch)
+                self.combo_save_channel.blockSignals(False)
+        else:
+            # 기존 파일에 채널 정보가 없으면 기본값인 IR로 설정
+            self.combo_save_channel.blockSignals(True)
+            self.combo_save_channel.setCurrentIndex(0)
+            self.combo_save_channel.blockSignals(False)
+
         for _, row in df.iterrows():
             try:
                 self._add_segment_internal(float(row['start_time']), float(row['end_time']))
@@ -386,6 +408,40 @@ class SegmentLabelerApp(QMainWindow):
     def save_segments(self):
         if not self.current_folder:
             return
+            
+        view_ch = self.combo_channel.currentText()
+        save_ch = self.combo_save_channel.currentText()
+        
+        # 경고 1: 보고 있는 채널과 저장 지정 채널이 다를 경우
+        if view_ch != save_ch:
+            reply = QMessageBox.question(
+                self, "보기 채널과 저장 채널 불일치",
+                f"현재 화면에서 보고 있는 채널({view_ch})과 저장 지정 채널({save_ch})이 다릅니다.\n"
+                f"정말 {save_ch} 채널로 저장하시겠습니까?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+                
+        # 경고 2: 기존에 저장된 채널과 현재 선택한 저장 지정 채널이 다를 경우
+        path = os.path.join(self.current_folder, LABEL_FILENAME)
+        if os.path.exists(path):
+            try:
+                old_df = pd.read_csv(path)
+                if 'channel' in old_df.columns and len(old_df) > 0:
+                    old_ch = str(old_df['channel'].iloc[0]).upper()
+                    if old_ch != save_ch:
+                        reply = QMessageBox.question(
+                            self, "기존 저장 채널과 불일치",
+                            f"이전에 저장된 파일의 채널({old_ch})과 현재 선택한 저장 지정 채널({save_ch})이 다릅니다.\n"
+                            f"기존 파일을 {save_ch} 채널로 덮어씌우시겠습니까?",
+                            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                        )
+                        if reply != QMessageBox.Yes:
+                            return
+            except Exception:
+                pass
+
         if not self.segments:
             reply = QMessageBox.question(
                 self, "확인",
@@ -394,18 +450,24 @@ class SegmentLabelerApp(QMainWindow):
             )
             if reply != QMessageBox.Yes:
                 return
-        path = os.path.join(self.current_folder, LABEL_FILENAME)
         # 시작시간 기준 정렬
         segs = sorted(self.segments, key=lambda x: x['start'])
         try:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 w = csv.writer(f)
-                w.writerow(['segment_id', 'start_time', 'end_time', 'length'])
+                w.writerow(['segment_id', 'start_time', 'end_time', 'length', 'channel'])
                 for i, s in enumerate(segs, 1):
-                    w.writerow([i, f"{s['start']:.4f}", f"{s['end']:.4f}", f"{s['end']-s['start']:.4f}"])
+                    w.writerow([
+                        i, 
+                        f"{s['start']:.4f}", 
+                        f"{s['end']:.4f}", 
+                        f"{s['end']-s['start']:.4f}",
+                        save_ch
+                    ])
             self._unsaved = False
             self.lbl_status.setText(f"저장 완료: {path}")
         except Exception as e:
+            QMessageBox.warning(self, "저장 실패", str(e))
             QMessageBox.warning(self, "저장 실패", str(e))
 
     def reset_labels(self):
