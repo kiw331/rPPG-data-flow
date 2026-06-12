@@ -106,7 +106,7 @@ class PPGGapViewer(QMainWindow):
         row2.addWidget(QLabel("~"))
         self.spin_hi = QDoubleSpinBox()
         self.spin_hi.setRange(1.0, 50.0); self.spin_hi.setSingleStep(0.5)
-        self.spin_hi.setValue(12.0)
+        self.spin_hi.setValue(9.0)
         row2.addWidget(self.spin_hi)
         btn_proc = QPushButton("⚙️ 재처리")
         btn_proc.clicked.connect(self._process_and_draw)
@@ -342,7 +342,15 @@ class PPGGapViewer(QMainWindow):
             if len(pk0) < 2:
                 vl0, _ = find_peaks(-ss, distance=mind_boot, prominence=prom)
                 return pk0, vl0, False, False, []
-            avg_T = np.median(np.diff(ts[pk0]))
+            
+            diffs = np.diff(ts[pk0])
+            # BPF 최대 주파수(bpf_hi)에 대응하는 최소 주기보다 작은 비정상 주기는 제외하고 평균 주기 계산
+            min_allowed_period = 1.0 / bpf_hi
+            valid_diffs = diffs[diffs >= min_allowed_period]
+            if len(valid_diffs) >= 2:
+                avg_T = np.median(valid_diffs)
+            else:
+                avg_T = np.median(diffs)
 
             # ── Step 2: 본 탐지 — 최소 간격 0.6×avg_T (한 파형 이중 탐지 방지) ──
             mind = max(mind_boot, round(0.6 * avg_T * fs))
@@ -351,7 +359,13 @@ class PPGGapViewer(QMainWindow):
             if len(pk) < 2:
                 return pk, vl, False, False, []
 
-            avg_T = np.median(np.diff(ts[pk]))   # 재계산
+            # 본 탐지 결과의 주기 계산 시에도 비정상 주기를 필터링하여 재계산
+            diffs_p = np.diff(ts[pk])
+            valid_diffs_p = diffs_p[diffs_p >= min_allowed_period]
+            if len(valid_diffs_p) >= 2:
+                avg_T = np.median(valid_diffs_p)
+            else:
+                avg_T = np.median(diffs_p)
 
             # ── Step 2.5: 내부 누락 피크/밸리 보완 ──
             # 인접 피크 간격이 1.4×avg_T 초과 → 그 사이에 피크가 누락됐을 가능성

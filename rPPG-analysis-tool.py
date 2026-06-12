@@ -1,11 +1,19 @@
 import os
+import sys
 import cv2
 import json
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 import tifffile
+
+# modules 디렉터리를 sys.path에 추가하여 modules/sam3를 직접 import할 수 있도록 설정
+modules_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules")
+if modules_dir not in sys.path:
+    sys.path.append(modules_dir)
+
 from scipy.signal import butter, filtfilt, find_peaks
+from scipy.ndimage import uniform_filter1d
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QSlider, QSpinBox,
                              QDoubleSpinBox, QComboBox, QRadioButton, QButtonGroup,
@@ -48,6 +56,39 @@ def try_import_sam3(force_no=False):
         return False
 
 
+# =====================================================================
+# Unet++ 선택적 로딩 함수
+# =====================================================================
+HAS_UNETPP = False
+
+def try_import_unetpp(force_no=False):
+    global HAS_UNETPP
+    if force_no:
+        HAS_UNETPP = False
+        return False
+    try:
+        import torch
+        import albumentations as A
+        from albumentations.pytorch import ToTensorV2
+        import segmentation_models_pytorch as smp
+        
+        HAS_UNETPP = True
+        print("[Unet++] Unet++ dependencies successfully imported.")
+        return True
+    except Exception as e:
+        print(f"[Unet++] Unet++ Import failed or disabled: {e}")
+        HAS_UNETPP = False
+        return False
+
+
+
+# =====================================================================
+# 예외 클래스 정의
+# =====================================================================
+class HFAuthError(Exception):
+    pass
+
+
 # ====================================
 class AnalysisWorker(QThread):
     progress_signal = pyqtSignal(int, str)
@@ -55,7 +96,8 @@ class AnalysisWorker(QThread):
     error_signal = pyqtSignal(str)
 
     def __init__(self, folder_path, start_frame_idx, duration_sec, rois_info, bg_roi_info, bpm_min, bpm_max,
-                 roi_mode="manual", sam3_model=None, active_sam3_rois=None, sam_conf=0.3, sam_min_area=100):
+                 roi_mode="manual", sam3_model=None, active_sam3_rois=None, sam_conf=0.3, sam_min_area=100,
+                 unetpp_model=None, unetpp_transform=None):
         super().__init__()
         self.folder_path = folder_path
         self.start_frame_idx = start_frame_idx
@@ -66,12 +108,14 @@ class AnalysisWorker(QThread):
         self.bpm_max = bpm_max
         self.is_running = True
         
-        # SAM3 모드 관련 설정
+        # SAM3 및 Unet++ 모드 관련 설정
         self.roi_mode = roi_mode
         self.sam3_model = sam3_model
         self.active_sam3_rois = active_sam3_rois if active_sam3_rois is not None else []
         self.sam_conf = sam_conf
         self.sam_min_area = sam_min_area
+        self.unetpp_model = unetpp_model
+        self.unetpp_transform = unetpp_transform
 
     def detect_sam3_regions(self, img_rgb, processor, autocast_ctx) -> dict:
         """
@@ -145,6 +189,69 @@ class AnalysisWorker(QThread):
                         
         return res_masks
 
+    def detect_unetpp_regions(self, img_rgb, model, transform, device) -> dict:
+        """
+        주어진 RGB 이미지에서 Unet++를 통해 'tail', 'foot1', 'foot2' 마스크를 반환.
+        """
+        import torch
+        import cv2
+        import numpy as np
+
+        if img_rgb.dtype == np.uint16:
+            img_8u = (img_rgb / 16.0).clip(0, 255).astype(np.uint8)
+        else:
+            img_8u = img_rgb.astype(np.uint8)
+
+        tensor = transform(image=img_8u)["image"].unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            pred = model(tensor) # (1, C, H, W)
+            pred_mask = torch.argmax(pred, dim=1).squeeze(0).cpu().numpy() # (H, W)
+
+        res_masks = {}
+
+        # 2: tail 검출 (최대 1개 blob)
+        if 'tail' in self.active_sam3_rois:
+            tail_mask = (pred_mask == 2).astype(np.uint8)
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(tail_mask)
+            
+            valid_blobs = []
+            for i in range(1, num_labels):
+                area = stats[i, cv2.CC_STAT_AREA]
+                if area >= self.sam_min_area:
+                    valid_blobs.append((i, area))
+            
+            if valid_blobs:
+                valid_blobs.sort(key=lambda x: x[1], reverse=True)
+                best_label = valid_blobs[0][0]
+                res_masks['tail'] = (labels == best_label).astype(np.uint8)
+
+        # 1: foot 검출 (최대 2개 blob, x좌표 순 정렬)
+        if 'foot1' in self.active_sam3_rois or 'foot2' in self.active_sam3_rois:
+            foot_mask = (pred_mask == 1).astype(np.uint8)
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(foot_mask)
+            
+            valid_blobs = []
+            for i in range(1, num_labels):
+                area = stats[i, cv2.CC_STAT_AREA]
+                if area >= self.sam_min_area:
+                    cx = centroids[i][0]
+                    valid_blobs.append((i, area, cx))
+                    
+            if valid_blobs:
+                valid_blobs.sort(key=lambda x: x[1], reverse=True)
+                top_blobs = valid_blobs[:2]
+                
+                if len(top_blobs) == 2:
+                    top_blobs.sort(key=lambda x: x[2]) # x가 작은 순 (왼쪽이 먼저)
+                    res_masks['foot1'] = (labels == top_blobs[0][0]).astype(np.uint8)
+                    res_masks['foot2'] = (labels == top_blobs[1][0]).astype(np.uint8)
+                else:
+                    # 1개만 검출된 경우 foot1으로 지정
+                    res_masks['foot1'] = (labels == top_blobs[0][0]).astype(np.uint8)
+
+        return res_masks
+
     def run(self):
         try:
             self.progress_signal.emit(0, "메타데이터 및 CSV 확인 중...")
@@ -180,14 +287,30 @@ class AnalysisWorker(QThread):
             # 센서 데이터 자르기
             t_sensor = np.array([])
             y_sensor = np.array([])
+            y_sensor_ir = np.array([])
+            y_sensor_red = np.array([])
             if has_sensor:
                 sensor_mask = (df_sensor['Timestamp'] - t0 >= start_time_offset) & (df_sensor['Timestamp'] - t0 <= end_time_offset)
                 df_sensor_cut = df_sensor[sensor_mask]
                 t_sensor = df_sensor_cut['Timestamp'].values - t0
+                
+                # IR
                 if 'IR_Value_Raw' in df_sensor_cut.columns:
-                    y_sensor = df_sensor_cut['IR_Value_Raw'].values
+                    y_sensor_ir = df_sensor_cut['IR_Value_Raw'].values
                 elif 'IR_Value' in df_sensor_cut.columns:
-                    y_sensor = df_sensor_cut['IR_Value'].values
+                    y_sensor_ir = df_sensor_cut['IR_Value'].values
+                
+                # RED
+                if 'RED_Value_Raw' in df_sensor_cut.columns:
+                    y_sensor_red = df_sensor_cut['RED_Value_Raw'].values
+                elif 'RED_Value' in df_sensor_cut.columns:
+                    y_sensor_red = df_sensor_cut['RED_Value'].values
+                    
+                # Default y_sensor is IR, fallback to RED
+                if len(y_sensor_ir) > 0:
+                    y_sensor = y_sensor_ir
+                elif len(y_sensor_red) > 0:
+                    y_sensor = y_sensor_red
 
             # 데이터 추출 루프 준비
             total_frames = len(df_cam_cut)
@@ -199,8 +322,8 @@ class AnalysisWorker(QThread):
                 # SAM3 전용 변수들
                 roi_names = list(self.active_sam3_rois)
                 roi_count = len(roi_names)
-                has_bg = False
-                total_regions = roi_count
+                has_bg = self.bg_roi_info is not None
+                total_regions = roi_count + (1 if has_bg else 0)
                 
                 # SAM3 Processor 스레드 내 로딩
                 self.progress_signal.emit(5, "SAM3 세그먼테이션 엔진 로드 중...")
@@ -210,6 +333,19 @@ class AnalysisWorker(QThread):
                 device = "cuda"
                 processor = Sam3Processor(self.sam3_model, device=device, confidence_threshold=self.sam_conf)
                 autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                
+                last_masks = {}
+                warning_messages = []
+            elif self.roi_mode == "unetpp":
+                # Unet++ 전용 변수들
+                roi_names = list(self.active_sam3_rois)
+                roi_count = len(roi_names)
+                has_bg = self.bg_roi_info is not None
+                total_regions = roi_count + (1 if has_bg else 0)
+                
+                self.progress_signal.emit(5, "Unet++ 세그먼테이션 엔진 준비 중...")
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
                 
                 last_masks = {}
                 warning_messages = []
@@ -278,6 +414,60 @@ class AnalysisWorker(QThread):
                             raw_rgb_data[r_idx, idx, 0] = r_mean
                             raw_rgb_data[r_idx, idx, 1] = g_mean
                             raw_rgb_data[r_idx, idx, 2] = b_mean
+                            
+                    # 수동 배경 영역이 추가 설정되었을 경우 추출
+                    if has_bg:
+                        bx, by, bw, bh = self.bg_roi_info
+                        y_start = max(0, int(by))
+                        y_end = min(img_rgb.shape[0], int(by+bh))
+                        x_start = max(0, int(bx))
+                        x_end = min(img_rgb.shape[1], int(bx+bw))
+                        crop = img_rgb[y_start:y_end, x_start:x_end]
+                        if crop.size > 0:
+                            raw_rgb_data[roi_count, idx, 0] = np.mean(crop[:, :, 0])
+                            raw_rgb_data[roi_count, idx, 1] = np.mean(crop[:, :, 1])
+                            raw_rgb_data[roi_count, idx, 2] = np.mean(crop[:, :, 2])
+                            
+                elif self.roi_mode == "unetpp":
+                    # Unet++ 각 프레임 세그먼테이션 실행
+                    current_masks = self.detect_unetpp_regions(img_rgb, self.unetpp_model, self.unetpp_transform, device)
+                    
+                    for r_idx, name in enumerate(roi_names):
+                        mask = current_masks.get(name)
+                        if mask is None or np.sum(mask) == 0:
+                            # 검출 실패 시 직전 프레임 마스크 재사용
+                            if name in last_masks:
+                                mask = last_masks[name]
+                                warning_messages.append(f"Frame {f_idx}: '{name}' 객체가 검출되지 않아 직전 프레임의 영역을 사용했습니다.")
+                            else:
+                                mask = np.zeros(img_rgb.shape[:2], dtype=np.uint8)
+                        
+                        # 검출 성공시 마스크 캐싱
+                        if np.sum(mask) > 0:
+                            last_masks[name] = mask
+                            
+                        # 마스크 영역 내 평균 RGB 추출
+                        if np.sum(mask) > 0:
+                            crop_pixels = img_rgb[mask > 0]
+                            r_mean = np.mean(crop_pixels[:, 0])
+                            g_mean = np.mean(crop_pixels[:, 1])
+                            b_mean = np.mean(crop_pixels[:, 2])
+                            raw_rgb_data[r_idx, idx, 0] = r_mean
+                            raw_rgb_data[r_idx, idx, 1] = g_mean
+                            raw_rgb_data[r_idx, idx, 2] = b_mean
+                            
+                    # 수동 배경 영역이 추가 설정되었을 경우 추출
+                    if has_bg:
+                        bx, by, bw, bh = self.bg_roi_info
+                        y_start = max(0, int(by))
+                        y_end = min(img_rgb.shape[0], int(by+bh))
+                        x_start = max(0, int(bx))
+                        x_end = min(img_rgb.shape[1], int(bx+bw))
+                        crop = img_rgb[y_start:y_end, x_start:x_end]
+                        if crop.size > 0:
+                            raw_rgb_data[roi_count, idx, 0] = np.mean(crop[:, :, 0])
+                            raw_rgb_data[roi_count, idx, 1] = np.mean(crop[:, :, 1])
+                            raw_rgb_data[roi_count, idx, 2] = np.mean(crop[:, :, 2])
                 else:
                     # manual 모드 ROI 평균 RGB 추출
                     for r_idx, (x, y, w, h) in enumerate(all_rois):
@@ -321,6 +511,10 @@ class AnalysisWorker(QThread):
                 'has_sensor': has_sensor,
                 't_sensor': t_sensor,
                 'y_sensor': y_sensor,
+                'y_sensor_ir': y_sensor_ir,
+                'y_sensor_red': y_sensor_red,
+                't0': t0,
+                't0_sensor': df_sensor['Timestamp'].iloc[0] if (has_sensor and df_sensor is not None and len(df_sensor) > 0) else t0,
                 'fs_cam': fs_cam,
                 'fs_sensor': fs_sensor,
                 'bpm_min': self.bpm_min,
@@ -339,6 +533,280 @@ class AnalysisWorker(QThread):
 
 
 # =====================================================================
+# PPG 보간 재건 함수 (standalone, GraphPopup 및 MainWindow 공용)
+# =====================================================================
+def reconstruct_ppg_signal(t_sensor, y_sensor, fs, bpf_lo, bpf_hi,
+                            df_segments, t0, t0_sensor):
+    """ppg_gap_viewer.py 와 동일한 보간 알고리즘 적용.
+    
+    Args:
+        t_sensor  : 분석 구간의 센서 타임스탬프 배열 (절대 기준)
+        y_sensor  : 대응하는 원시 신호 배열
+        fs        : 센서 샘플링 주파수 (Hz)
+        bpf_lo    : 밴드패스 하한 (Hz)
+        bpf_hi    : 밴드패스 상한 (Hz)
+        df_segments : hr_segments.csv DataFrame
+        t0        : 분석 기준 시간 원점 (카메라/센서 공통)
+        t0_sensor : 센서 CSV 원점 타임스탬프
+    
+    Returns:
+        sig_rp   : 보간 포함 재건 신호 (NaN=미채움)
+        sig_sp   : 합성 구간만 추출한 신호 (NaN=실신호)
+        filled   : bool 배열 – 채워진 인덱스
+        is_syn   : bool 배열 – 합성(보간) 인덱스
+        valid    : 유효 세그먼트 리스트
+        gaps     : 갭 구간 리스트
+    """
+    PAD_SEC    = 0.30
+    MA_WIN_SEC = 0.15
+    BPF_ORDER  = 4
+    PEAK_PROM  = 0.3
+
+    if df_segments is None or len(df_segments) == 0:
+        n = len(t_sensor)
+        return (np.full(n, np.nan), np.full(n, np.nan),
+                np.zeros(n, bool), np.zeros(n, bool), [], [])
+
+    # 센서 타임스탬프를 hr_segments.csv 기준으로 변환
+    t_rel = t_sensor + t0 - t0_sensor
+    t        = t_rel
+    sig_raw  = y_sensor.astype(float)
+
+    def _bpf(sig):
+        nyq = fs / 2
+        hi  = min(bpf_hi, nyq * 0.98)
+        lo  = max(0.01,   bpf_lo)
+        b, a = butter(BPF_ORDER, [lo / nyq, hi / nyq], btype='band')
+        return filtfilt(b, a, sig)
+
+    def proc_iso(s, e):
+        m = (t >= s) & (t <= e)
+        t_i, s_i = t[m], sig_raw[m].copy()
+        if len(s_i) < 3:
+            return t_i, s_i
+        pad = int(PAD_SEC * fs)
+        s_pad = np.pad(s_i, pad, mode='edge')
+        ma_n  = max(3, int(MA_WIN_SEC * fs))
+        s_pad = s_pad - uniform_filter1d(s_pad, ma_n)
+        s_pad = _bpf(s_pad)
+        return t_i, s_pad[pad:-pad]
+
+    def detect(ts, ss, seg_start, seg_end):
+        prom      = ss.std() * PEAK_PROM
+        prom_edge = ss.std() * 0.12
+        mind_boot = max(2, int(0.05 * fs))
+        pk0, _ = find_peaks(ss, distance=mind_boot, prominence=prom)
+        if len(pk0) < 2:
+            vl0, _ = find_peaks(-ss, distance=mind_boot, prominence=prom)
+            return pk0, vl0, False, False, []
+        diffs = np.diff(ts[pk0])
+        min_period = 1.0 / bpf_hi
+        valid_d = diffs[diffs >= min_period]
+        avg_T   = np.median(valid_d) if len(valid_d) >= 2 else np.median(diffs)
+        mind    = max(mind_boot, round(0.6 * avg_T * fs))
+        pk, _  = find_peaks( ss, distance=mind, prominence=prom)
+        vl, _  = find_peaks(-ss, distance=mind, prominence=prom)
+        if len(pk) < 2:
+            return pk, vl, False, False, []
+        diffs_p  = np.diff(ts[pk])
+        valid_dp = diffs_p[diffs_p >= min_period]
+        avg_T    = np.median(valid_dp) if len(valid_dp) >= 2 else np.median(diffs_p)
+
+        def _fill(arr, inv=False):
+            nonlocal avg_T
+            changed = True
+            while changed:
+                changed = False
+                if len(arr) < 2: break
+                ivls = np.diff(ts[arr])
+                for i in np.where(ivls > 1.4 * avg_T)[0]:
+                    t_mid = (ts[arr[i]] + ts[arr[i+1]]) / 2
+                    win   = 0.35 * avg_T
+                    m_w   = (ts >= t_mid - win) & (ts <= t_mid + win)
+                    if m_w.sum() < 3: continue
+                    sw = -ss[m_w] if inv else ss[m_w]
+                    ep, _ = find_peaks(sw, distance=mind_boot, prominence=prom * 0.15)
+                    ni = (np.where(m_w)[0][ep[np.argmax(sw[ep])]] if len(ep)
+                          else np.where(m_w)[0][np.argmax(sw)])
+                    arr   = np.sort(np.unique(np.append(arr, ni)))
+                    avg_T = np.median(np.diff(ts[arr]))
+                    changed = True; break
+            return arr
+
+        interior_syn = []
+        for i in np.where(np.diff(ts[pk]) > 1.4 * avg_T)[0]:
+            interior_syn.append((ts[pk[i]], ts[pk[i+1]]))
+        pk = _fill(pk); vl = _fill(vl, inv=True)
+
+        avg_T  = np.median(np.diff(ts[pk]))
+        ref_pk = np.median(ss[pk])
+
+        def _edge(t_lo, t_hi):
+            m = (ts >= t_lo) & (ts <= t_hi)
+            if m.sum() <= 3: return np.array([], dtype=int)
+            ep, _ = find_peaks(ss[m], distance=mind_boot, prominence=prom_edge)
+            if not len(ep): return np.array([], dtype=int)
+            ai = np.where(m)[0][ep]
+            ok = (ss[ai] > 0) & (ss[ai] <= ref_pk * 1.8)
+            if not ok.any(): return np.array([], dtype=int)
+            ai = ai[ok]
+            return np.array([ai[np.argmax(ss[ai])]])
+
+        if ts[pk[0]] > seg_start + avg_T:
+            new = _edge(seg_start, seg_start + avg_T)
+            if len(new): pk = np.sort(np.unique(np.append(pk, new)))
+        if ts[pk[-1]] < seg_end - avg_T:
+            new = _edge(seg_end - avg_T, seg_end)
+            if len(new): pk = np.sort(np.unique(np.append(pk, new)))
+
+        events, last_type, trunc = [], None, False
+        for p in pk: events.append((ts[p],  1, p))
+        for v in vl: events.append((ts[v], -1, v))
+        events.sort(key=lambda x: x[0])
+        valid_ev = []
+        for ev in events:
+            _, tp, _ = ev
+            if last_type is not None and tp == last_type: trunc = True; break
+            valid_ev.append(ev); last_type = tp
+        if trunc:
+            pk = np.array([e[2] for e in valid_ev if e[1] ==  1], dtype=int)
+            vl = np.array([e[2] for e in valid_ev if e[1] == -1], dtype=int)
+
+        added_head = added_tail = False
+        if len(pk) >= 2:
+            avg_T = np.median(np.diff(ts[pk]))
+            frt   = ts[pk[0]]
+            while ts[pk[0]] - seg_start > avg_T:
+                tn  = max(seg_start + 0.5 * avg_T, ts[0], ts[pk[0]] - avg_T)
+                idx = int(np.argmin(np.abs(ts - tn)))
+                if idx >= pk[0] or idx <= 0: break
+                pk = np.sort(np.unique(np.append(pk, idx))); added_head = True
+            if added_head: interior_syn.append((ts[pk[0]], frt))
+            lrt = ts[pk[-1]]
+            while seg_end - ts[pk[-1]] > avg_T:
+                tn  = min(seg_end - 0.5 * avg_T, ts[-1], ts[pk[-1]] + avg_T)
+                idx = int(np.argmin(np.abs(ts - tn)))
+                if idx <= pk[-1] or idx >= len(ts) - 1: break
+                pk = np.sort(np.unique(np.append(pk, idx))); added_tail = True
+            if added_tail: interior_syn.append((lrt, ts[pk[-1]]))
+
+        return pk, vl, added_head, added_tail, interior_syn
+
+    def env_norm(tr, sr, tpk, spk, tvl, svl):
+        upper = np.interp(tr, tpk, spk)
+        lower = np.interp(tr, tvl, svl)
+        d = np.where(upper - lower < 1e-9, 1e-9, upper - lower)
+        return np.clip(2.0 * (sr - lower) / d - 1.0, -1.0, 1.0)
+
+    def gen_synth(tg, T_start, T_end=None, start_type='peak', end_type='peak', valley_ref=-1.0):
+        if T_end is None: T_end = T_start
+        dur = tg[-1] - tg[0]
+        if dur <= 0 or len(tg) < 2:
+            return np.full(len(tg), 1.0 if start_type == 'peak' else valley_ref)
+        T_hm = 2 * T_start * T_end / (T_start + T_end)
+        if start_type == end_type:
+            delta = 2 * np.pi * max(1, round(dur / T_hm))
+        else:
+            nh = max(1, round(2 * (dur / T_hm) - 1))
+            if nh % 2 == 0: nh += 1
+            delta = np.pi * nh
+        w0, w1  = 2 * np.pi / T_start, 2 * np.pi / T_end
+        a       = (tg - tg[0]) / dur
+        phi_raw = dur * (w0 * a + (w1 - w0) * a ** 2 / 2)
+        phi     = phi_raw * (delta / phi_raw[-1]) if phi_raw[-1] > 0 else phi_raw
+        y       = np.cos(phi) if start_type == 'peak' else -np.cos(phi)
+        mid, amp = (1.0 + valley_ref) / 2, (1.0 - valley_ref) / 2
+        return mid + amp * y
+
+    segs = []
+    for _, row in df_segments.iterrows():
+        s, e       = row["start_time"], row["end_time"]
+        ts_s, ss_s = proc_iso(s, e)
+        if len(ts_s) < 10: segs.append(None); continue
+        pk, vl, fh, ft, int_syn = detect(ts_s, ss_s, ts_s[0], ts_s[-1])
+        if len(pk) < 2 or len(vl) < 1: segs.append(None); continue
+        tlo, thi = ts_s[pk[0]], ts_s[pk[-1]]
+        mpp = (ts_s >= tlo) & (ts_s <= thi)
+        if mpp.sum() < 5: segs.append(None); continue
+        tr, sr   = ts_s[mpp], ss_s[mpp]
+        pkr      = pk[(ts_s[pk] >= tlo) & (ts_s[pk] <= thi)]
+        vlr      = vl[(ts_s[vl] >= tlo) & (ts_s[vl] <= thi)]
+        if len(pkr) < 2 or len(vlr) < 1: segs.append(None); continue
+        try:
+            sn = env_norm(tr, sr, ts_s[pkr], ss_s[pkr], ts_s[vlr], ss_s[vlr])
+        except Exception: segs.append(None); continue
+
+        def _rep(t0l, t1l):
+            ms = (tr >= t0l) & (tr <= t1l)
+            if ms.sum() < 2: return
+            mT = float(np.median(np.diff(ts_s[pkr]))) if len(pkr) > 1 else (t1l - t0l)
+            sn[ms] = gen_synth(tr[ms], mT)
+
+        for t0l, t1l in int_syn: _rep(t0l, t1l)
+        if len(pkr) >= 2:
+            amp = ss_s[pkr]
+            for i in range(len(pkr) - 1):
+                lo, hi2 = min(abs(amp[i]), abs(amp[i+1])), max(abs(amp[i]), abs(amp[i+1]))
+                if lo > 0 and hi2 / lo > 1.8: _rep(ts_s[pkr[i]], ts_s[pkr[i+1]])
+        for i in range(len(pkr) - 1):
+            t0l, t1l = ts_s[pkr[i]], ts_s[pkr[i+1]]
+            mc = (tr >= t0l) & (tr <= t1l)
+            if mc.sum() < 4: continue
+            alpha = (tr[mc] - tr[mc][0]) / (tr[mc][-1] - tr[mc][0] + 1e-12)
+            if np.sqrt(np.mean((sn[mc] - np.cos(2*np.pi*alpha))**2)) > 0.25:
+                _rep(t0l, t1l)
+
+        pk_ivl = np.diff(ts_s[pkr])
+        T_med  = float(np.median(pk_ivl)) if len(pk_ivl) else 0.15
+        N_loc  = min(5, len(pk_ivl))
+        p_head = float(np.median(pk_ivl[:N_loc])) if len(pk_ivl) else T_med
+        p_tail = float(np.median(pk_ivl[-N_loc:])) if len(pk_ivl) else T_med
+        p_head = np.clip(p_head, 0.85*T_med, 1.15*T_med)
+        p_tail = np.clip(p_tail, 0.85*T_med, 1.15*T_med)
+        s_corr = tlo - 0.5*T_med if (tlo-s < 0.25*T_med or tlo-s > 0.75*T_med) else s
+        e_corr = thi + 0.5*T_med if (e-thi < 0.25*T_med or e-thi > 0.75*T_med) else e
+        segs.append({"t": tr, "sig": sn, "period": T_med,
+                     "period_head": p_head, "period_tail": p_tail,
+                     "t_s": tlo, "t_e": thi,
+                     "label_start": s_corr, "label_end": e_corr})
+
+    valid = [s for s in segs if s is not None]
+    n     = len(t)
+    sig_rc, filled, is_syn = np.full(n, np.nan), np.zeros(n, bool), np.zeros(n, bool)
+
+    for seg in valid:
+        m_real = (t >= seg["t_s"]) & (t <= seg["t_e"])
+        sig_rc[m_real] = np.interp(t[m_real], seg["t"], seg["sig"])
+        filled[m_real] = True
+        if seg["t_s"] > seg["label_start"]:
+            m = (t >= seg["label_start"]) & (t < seg["t_s"])
+            if m.sum() >= 2:
+                sig_rc[m] = gen_synth(t[m], seg["period_head"], start_type='valley', end_type='peak')
+                filled[m] = is_syn[m] = True
+        if seg["label_end"] > seg["t_e"]:
+            m = (t > seg["t_e"]) & (t <= seg["label_end"])
+            if m.sum() >= 2:
+                sig_rc[m] = gen_synth(t[m], seg["period_tail"], start_type='peak', end_type='valley')
+                filled[m] = is_syn[m] = True
+
+    for i in range(len(valid) - 1):
+        a, b   = valid[i], valid[i+1]
+        gs, ge = a["label_end"], b["label_start"]
+        if ge <= gs: continue
+        m = (t > gs) & (t < ge)
+        if m.sum() < 2: continue
+        sig_rc[m] = gen_synth(t[m], a["period_tail"], b["period_head"],
+                              start_type='valley', end_type='valley')
+        filled[m] = is_syn[m] = True
+
+    sig_rp = np.where(filled, sig_rc, np.nan)
+    sig_sp = np.where(is_syn,  sig_rc, np.nan)
+    gaps   = [(valid[i]["t_e"], valid[i+1]["t_s"], valid[i], valid[i+1])
+              for i in range(len(valid)-1) if valid[i+1]["t_s"] > valid[i]["t_e"]]
+    return sig_rp, sig_sp, filled, is_syn, valid, gaps
+
+
+# =====================================================================
 # 세부 분석 팝업 UI (GraphPopup)
 # =====================================================================
 class GraphPopup(QDialog):
@@ -354,6 +822,7 @@ class GraphPopup(QDialog):
         self.start_frame_idx = start_frame_idx
 
         self.setup_ui()
+        self.init_ppg_selection()
         self.update_checkbox_labels()
         if self.analysis_result:
             self.update_graphs()
@@ -364,6 +833,58 @@ class GraphPopup(QDialog):
             for i, name in enumerate(roi_names):
                 if i < 3:
                     self.chks[i].setText(name)
+
+    def init_ppg_selection(self):
+        if not self.analysis_result:
+            self.group_ppg_select.setVisible(False)
+            return
+
+        res = self.analysis_result
+        has_ir = len(res.get('y_sensor_ir', [])) > 0
+        has_red = len(res.get('y_sensor_red', [])) > 0
+        
+        import os
+        import pandas as pd
+        hr_seg_path = os.path.join(self.folder_path, "hr_segments.csv")
+        self.has_hr_segments = os.path.exists(hr_seg_path)
+        
+        self.radio_ppg_ir.setVisible(has_ir)
+        self.radio_ppg_red.setVisible(has_red)
+        self.radio_ppg_recon.setVisible(self.has_hr_segments)
+        
+        if not res.get('has_sensor', False) or (not has_ir and not has_red):
+            self.group_ppg_select.setVisible(False)
+            return
+            
+        self.group_ppg_select.setVisible(True)
+        
+        default_channel = "IR"
+        if self.has_hr_segments:
+            try:
+                self.df_segments = pd.read_csv(hr_seg_path)
+                if len(self.df_segments) > 0 and 'channel' in self.df_segments.columns:
+                    first_chan = str(self.df_segments['channel'].iloc[0]).upper()
+                    if "RED" in first_chan:
+                        default_channel = "RED"
+            except Exception as e:
+                print(f"Error reading hr_segments.csv: {e}")
+                self.df_segments = None
+                self.has_hr_segments = False
+                self.radio_ppg_recon.setVisible(False)
+        else:
+            self.df_segments = None
+            
+        if default_channel == "RED" and has_red:
+            self.radio_ppg_red.setChecked(True)
+        else:
+            if has_ir:
+                self.radio_ppg_ir.setChecked(True)
+            elif has_red:
+                self.radio_ppg_red.setChecked(True)
+
+    def on_ppg_type_changed(self, btn_id, checked):
+        if checked:
+            self.update_graphs()
 
     def setup_ui(self):
         main_layout = QVBoxLayout(self)
@@ -408,6 +929,26 @@ class GraphPopup(QDialog):
             
         group_show.setLayout(show_layout)
         top_layout.addWidget(group_show)
+
+        # PPG 데이터 선택
+        self.group_ppg_select = QGroupBox("PPG 데이터 선택")
+        ppg_sel_layout = QHBoxLayout()
+        self.radio_ppg_ir = QRadioButton("Raw IR")
+        self.radio_ppg_red = QRadioButton("Raw RED")
+        self.radio_ppg_recon = QRadioButton("보간 신호 (Recon)")
+        
+        self.bg_ppg_type = QButtonGroup()
+        self.bg_ppg_type.addButton(self.radio_ppg_ir, 0)
+        self.bg_ppg_type.addButton(self.radio_ppg_red, 1)
+        self.bg_ppg_type.addButton(self.radio_ppg_recon, 2)
+        
+        ppg_sel_layout.addWidget(self.radio_ppg_ir)
+        ppg_sel_layout.addWidget(self.radio_ppg_red)
+        ppg_sel_layout.addWidget(self.radio_ppg_recon)
+        self.group_ppg_select.setLayout(ppg_sel_layout)
+        top_layout.addWidget(self.group_ppg_select)
+        
+        self.bg_ppg_type.idToggled.connect(self.on_ppg_type_changed)
 
         top_layout.addStretch()
 
@@ -458,6 +999,17 @@ class GraphPopup(QDialog):
         b, a = butter(order, [low, high], btype='band')
         return filtfilt(b, a, data)
 
+    def reconstruct_ppg_signal(self, t_sensor, y_sensor, fs, bpf_lo, bpf_hi):
+        """모듈 레벨 reconstruct_ppg_signal 을 호출하는 래퍼."""
+        res = self.analysis_result
+        return reconstruct_ppg_signal(
+            t_sensor, y_sensor, fs, bpf_lo, bpf_hi,
+            df_segments=self.df_segments,
+            t0=res.get('t0', 0),
+            t0_sensor=res.get('t0_sensor', 0)
+        )
+
+
     def update_graphs(self):
         if not self.analysis_result: return
 
@@ -483,6 +1035,16 @@ class GraphPopup(QDialog):
         color_bg  = (200, 0, 200)
         color_ppg = (200, 200, 200)
 
+        # 현재 X축 범위 저장 (채널 전환 시 뷰 유지)
+        _saved_x_range = None
+        for _p in self.plots:
+            try:
+                if _p.plotItem.scene() is not None:
+                    _saved_x_range = _p.viewRange()[0]
+                    break
+            except Exception:
+                pass
+
         self.graph_layout.clear()
 
         self.max_time = t_cam_plot[-1] if len(t_cam_plot) > 0 else 1.0
@@ -503,20 +1065,77 @@ class GraphPopup(QDialog):
                 p.enableAutoRange(axis=pg.ViewBox.YAxis)
                 active_plots.append(p)
 
-        # ── 2. PPG Raw (체크된 경우) ──────────────────────────────────
+        # ── 2. PPG Raw / Recon (체크된 경우) ──────────────────────────
         if has_sensor and self.chk_ppg.isChecked():
             p_ppg = self.plots[4]
             p_ppg.clear()
+            # Remove any previous region items
+            for item in list(p_ppg.items):
+                if isinstance(item, pg.LinearRegionItem):
+                    p_ppg.removeItem(item)
+
             self.graph_layout.addItem(p_ppg)
             self.graph_layout.nextRow()
+            
             t_sensor = res['t_sensor']
-            y_sensor = res['y_sensor']
             t_sensor_plot = t_sensor - t_cam[0] if len(t_sensor) > 0 else t_sensor
-            p_ppg.plot(t_sensor_plot, y_sensor,
-                       pen=pg.mkPen(color_ppg, width=2))
-            p_ppg.setTitle("PPG Raw Sensor Data")
-            p_ppg.enableAutoRange(axis=pg.ViewBox.YAxis)
-            active_plots.append(p_ppg)
+            fs_sensor = (1.0 / np.mean(np.diff(t_sensor)) if len(t_sensor) > 1 else 60.0)
+            
+            ppg_type = self.bg_ppg_type.checkedId()
+            
+            if ppg_type == 0: # Raw IR
+                y_data = res.get('y_sensor_ir', res.get('y_sensor', []))
+                p_ppg.plot(t_sensor_plot, y_data, pen=pg.mkPen(color_ppg, width=2))
+                p_ppg.setTitle("PPG Raw Sensor Data (IR)")
+                p_ppg.enableAutoRange(axis=pg.ViewBox.YAxis)
+                active_plots.append(p_ppg)
+            elif ppg_type == 1: # Raw RED
+                y_data = res.get('y_sensor_red', [])
+                p_ppg.plot(t_sensor_plot, y_data, pen=pg.mkPen((255, 100, 100), width=2))
+                p_ppg.setTitle("PPG Raw Sensor Data (RED)")
+                p_ppg.enableAutoRange(axis=pg.ViewBox.YAxis)
+                active_plots.append(p_ppg)
+            elif ppg_type == 2 and self.has_hr_segments: # Reconstructed
+                chan = "IR"
+                if len(self.df_segments) > 0 and 'channel' in self.df_segments.columns:
+                    chan = str(self.df_segments['channel'].iloc[0]).upper()
+                
+                if "RED" in chan:
+                    y_raw = res.get('y_sensor_red', [])
+                else:
+                    y_raw = res.get('y_sensor_ir', res.get('y_sensor', []))
+                
+                if len(y_raw) > 0:
+                    sig_rp, sig_sp, filled, is_syn, valid_segs, gaps = self.reconstruct_ppg_signal(
+                        t_sensor, y_raw, fs_sensor, low_cut, high_cut
+                    )
+                    
+                    p_ppg.plot(t_sensor_plot, sig_rp, pen=pg.mkPen('#1f77b4', width=2), connect='finite', name='실신호')
+                    p_ppg.plot(t_sensor_plot, sig_sp, pen=pg.mkPen('#ff7f0e', width=2, style=Qt.PenStyle.DashLine), connect='finite', name='합성')
+                    p_ppg.setTitle(f"PPG Reconstructed Signal ({chan})")
+                    p_ppg.setYRange(-1.6, 1.6)
+                    active_plots.append(p_ppg)
+                    
+                    t0 = res.get('t0', 0)
+                    t0_sensor = res.get('t0_sensor', 0)
+                    t_cam_0 = t_cam[0] if len(t_cam) > 0 else 0
+                    dt_offset = t0_sensor - t0 - t_cam_0
+                    
+                    # 1. Real/Label areas: green/blue
+                    for seg in valid_segs:
+                        s_plot = seg['label_start'] + dt_offset
+                        e_plot = seg['label_end'] + dt_offset
+                        r_item = pg.LinearRegionItem(values=[s_plot, e_plot], movable=False,
+                                                    brush=pg.mkBrush(30, 180, 60, 40), pen=None)
+                        p_ppg.addItem(r_item)
+                        
+                    # 2. Gap/Interpolated areas: red
+                    for gs, ge, *_ in gaps:
+                        s_plot = gs + dt_offset
+                        e_plot = ge + dt_offset
+                        r_item = pg.LinearRegionItem(values=[s_plot, e_plot], movable=False,
+                                                    brush=pg.mkBrush(220, 30, 30, 45), pen=None)
+                        p_ppg.addItem(r_item)
 
         # ── 3. Background Raw (체크된 경우) ──────────────────────────
         if has_bg and self.chk_bg.isChecked():
@@ -580,12 +1199,56 @@ class GraphPopup(QDialog):
             # PPG 센서 신호 (체크된 경우, 센서 자체 샘플링 주파수 사용)
             if has_sensor and self.chk_ppg.isChecked():
                 t_sensor = res['t_sensor']
-                y_sensor = res['y_sensor']
                 t_sensor_plot = t_sensor - t_cam[0] if len(t_sensor) > 0 else t_sensor
                 fs_sensor = (1.0 / np.mean(np.diff(t_sensor))
                              if len(t_sensor) > 1 else fs_cam)
-                _plot_filtered(t_sensor_plot, y_sensor,
-                               fs_sensor, color_ppg, "PPG Sensor")
+                
+                ppg_type = self.bg_ppg_type.checkedId()
+                if ppg_type == 2 and self.has_hr_segments:
+                    # 보간 신호인 경우: 이미 필터링/보간 되었으므로 별도 필터링 없이 그대로 표시
+                    chan = "IR"
+                    if len(self.df_segments) > 0 and 'channel' in self.df_segments.columns:
+                        chan = str(self.df_segments['channel'].iloc[0]).upper()
+                    if "RED" in chan:
+                        y_raw = res.get('y_sensor_red', [])
+                    else:
+                        y_raw = res.get('y_sensor_ir', res.get('y_sensor', []))
+                    
+                    if len(y_raw) > 0:
+                        sig_rp, sig_sp, filled, is_syn, valid_segs, gaps = self.reconstruct_ppg_signal(
+                            t_sensor, y_raw, fs_sensor, low_cut, high_cut
+                        )
+                        valid_mask = ~np.isnan(sig_rp)
+                        if valid_mask.any():
+                            y_norm = sig_rp.copy()
+                            # std로 나누기 (다른 신호들과 z-score 스케일 정렬)
+                            sigma = np.nanstd(y_norm)
+                            if sigma > 0:
+                                y_norm = y_norm / sigma
+                            
+                            min_d = int(60.0 / bpm_max * fs_sensor)
+                            peaks, _ = find_peaks(np.nan_to_num(y_norm), distance=max(1, min_d), prominence=0.5)
+                            bpm = (60.0 / np.mean(np.diff(t_sensor_plot[peaks]))
+                                   if len(peaks) > 1 else 0)
+                            
+                            p_filt.plot(t_sensor_plot, y_norm,
+                                        pen=pg.mkPen(color_ppg, width=2),
+                                        name=f"PPG Sensor (Recon) (BPM: {bpm:.1f})",
+                                        connect='finite')
+                            if len(peaks) > 0:
+                                sc = pg.ScatterPlotItem(
+                                    x=t_sensor_plot[peaks], y=y_norm[peaks],
+                                    pen=None, brush=pg.mkBrush(color_ppg), size=8, symbol='x')
+                                p_filt.addItem(sc)
+                else:
+                    if ppg_type == 1:
+                        y_val = res.get('y_sensor_red', [])
+                        lbl = "PPG Sensor (RED)"
+                    else:
+                        y_val = res.get('y_sensor_ir', res.get('y_sensor', []))
+                        lbl = "PPG Sensor (IR)"
+                    _plot_filtered(t_sensor_plot, y_val,
+                                   fs_sensor, color_ppg, lbl)
 
             p_filt.enableAutoRange(axis=pg.ViewBox.YAxis)
             active_plots.append(p_filt)
@@ -594,15 +1257,21 @@ class GraphPopup(QDialog):
         for i, p in enumerate(active_plots):
             p.setXLink(active_plots[0] if i > 0 else None)
 
-        self.scrollbar_pan.blockSignals(True)
-        self.slider_zoom.blockSignals(True)
-        self.scrollbar_pan.setRange(0, 1000)
-        self.scrollbar_pan.setValue(0)
-        self.slider_zoom.setValue(100)
-        self.scrollbar_pan.blockSignals(False)
-        self.slider_zoom.blockSignals(False)
-
-        self.update_x_range()
+        # X축 슬라이더/스크롤바 설정 
+        # 저장된 범위가 있으면 zoom/pan 선령 유지, 없으면 전체 보기
+        if _saved_x_range is not None:
+            # 슬라이더는 그대로두고 X범위만 돌려놈음
+            if len(active_plots) > 0:
+                active_plots[0].setXRange(_saved_x_range[0], _saved_x_range[1], padding=0)
+        else:
+            self.scrollbar_pan.blockSignals(True)
+            self.slider_zoom.blockSignals(True)
+            self.scrollbar_pan.setRange(0, 1000)
+            self.scrollbar_pan.setValue(0)
+            self.slider_zoom.setValue(100)
+            self.scrollbar_pan.blockSignals(False)
+            self.slider_zoom.blockSignals(False)
+            self.update_x_range()
 
     def update_x_range(self):
         if not hasattr(self, 'max_time'): return
@@ -645,13 +1314,40 @@ class GraphPopup(QDialog):
         has_sensor = res['has_sensor']
         t_cam = res['t_cam']
         t_sensor = res['t_sensor']
-        y_sensor = res['y_sensor']
+        
+        # Get the selected PPG type
+        ppg_type = self.bg_ppg_type.checkedId()
+        
+        # Determine the signal to save
+        if ppg_type == 2 and self.has_hr_segments:
+            chan = "IR"
+            if len(self.df_segments) > 0 and 'channel' in self.df_segments.columns:
+                chan = str(self.df_segments['channel'].iloc[0]).upper()
+            if "RED" in chan:
+                y_raw = res.get('y_sensor_red', [])
+            else:
+                y_raw = res.get('y_sensor_ir', res.get('y_sensor', []))
+            
+            if len(y_raw) > 0:
+                fs_sensor = (1.0 / np.mean(np.diff(t_sensor)) if len(t_sensor) > 1 else 60.0)
+                low_cut = res['bpm_min'] / 60.0
+                high_cut = res['bpm_max'] / 60.0
+                sig_rp, sig_sp, filled, is_syn, valid_segs, gaps = self.reconstruct_ppg_signal(
+                    t_sensor, y_raw, fs_sensor, low_cut, high_cut
+                )
+                y_sensor_to_save = sig_rp
+            else:
+                y_sensor_to_save = res['y_sensor']
+        elif ppg_type == 1: # RED
+            y_sensor_to_save = res.get('y_sensor_red', [])
+        else: # IR / Default
+            y_sensor_to_save = res.get('y_sensor_ir', res.get('y_sensor', []))
         
         mapped_ppg = []
-        if has_sensor and len(t_sensor) > 0:
+        if has_sensor and len(t_sensor) > 0 and len(y_sensor_to_save) > 0:
             for tc in t_cam:
                 idx = (np.abs(t_sensor - tc)).argmin()
-                mapped_ppg.append(y_sensor[idx])
+                mapped_ppg.append(y_sensor_to_save[idx])
         else:
             mapped_ppg = [np.nan] * len(t_cam)
 
@@ -954,6 +1650,11 @@ class MainWindow(QMainWindow):
         self.sam3_processor = None
         self.autocast_ctx = None
 
+        # Unet++ 관련 속성
+        self.has_unetpp = try_import_unetpp()
+        self.unetpp_model = None
+        self.unetpp_transform = None
+
         self.play_timer = QTimer()
         self.play_timer.timeout.connect(self.play_next_frame)
 
@@ -1067,7 +1768,7 @@ class MainWindow(QMainWindow):
         mode_layout = QHBoxLayout()
         mode_layout.addWidget(QLabel("ROI 모드:"))
         self.combo_roi_mode = QComboBox()
-        self.combo_roi_mode.addItems(["ROI 직접설정", "SAM3 세그먼테이션"])
+        self.combo_roi_mode.addItems(["ROI 직접설정", "SAM3 세그먼테이션", "Unet++ 세그먼테이션"])
         mode_layout.addWidget(self.combo_roi_mode)
         set_layout.addLayout(mode_layout)
         self.combo_roi_mode.currentIndexChanged.connect(self.on_roi_mode_changed)
@@ -1100,13 +1801,13 @@ class MainWindow(QMainWindow):
         
         set_layout.addWidget(self.widget_manual_settings)
 
-        # --- 4-2. SAM3 세그먼테이션 설정 위젯 ---
+        # --- 4-2. SAM3 및 Unet++ 세그먼테이션 설정 위젯 ---
         self.widget_sam3_settings = QWidget()
         sam3_layout = QVBoxLayout(self.widget_sam3_settings)
         sam3_layout.setContentsMargins(0, 0, 0, 0)
 
         self.btn_segment = QPushButton("세그먼테이션")
-        self.btn_segment.clicked.connect(self.run_sam3_preview)
+        self.btn_segment.clicked.connect(self.run_segmentation_preview)
         sam3_layout.addWidget(self.btn_segment)
 
         chk_layout = QHBoxLayout()
@@ -1121,14 +1822,16 @@ class MainWindow(QMainWindow):
         chk_layout.addWidget(self.chk_sam_foot2)
         sam3_layout.addLayout(chk_layout)
 
-        conf_layout = QHBoxLayout()
+        self.widget_sam_conf = QWidget()
+        conf_layout = QHBoxLayout(self.widget_sam_conf)
+        conf_layout.setContentsMargins(0, 0, 0, 0)
         conf_layout.addWidget(QLabel("임계값:"))
         self.spin_sam_conf = QDoubleSpinBox()
         self.spin_sam_conf.setRange(0.1, 1.0)
         self.spin_sam_conf.setValue(0.3)
         self.spin_sam_conf.setSingleStep(0.05)
         conf_layout.addWidget(self.spin_sam_conf)
-        sam3_layout.addLayout(conf_layout)
+        sam3_layout.addWidget(self.widget_sam_conf)
 
         area_layout = QHBoxLayout()
         area_layout.addWidget(QLabel("최소 크기:"))
@@ -1138,13 +1841,34 @@ class MainWindow(QMainWindow):
         area_layout.addWidget(self.spin_sam_min_area)
         sam3_layout.addLayout(area_layout)
 
+        sam_bg_layout = QHBoxLayout()
+        sam_bg_layout.addWidget(QLabel("배경 영역:"))
+        self.spin_sam_bg_count = QSpinBox()
+        self.spin_sam_bg_count.setRange(0, 1)
+        self.spin_sam_bg_count.setValue(0)
+        self.spin_sam_bg_count.valueChanged.connect(self.update_auto_seg_bg_roi)
+        sam_bg_layout.addWidget(self.spin_sam_bg_count)
+        sam3_layout.addLayout(sam_bg_layout)
+
         set_layout.addWidget(self.widget_sam3_settings)
         self.widget_sam3_settings.setVisible(False) # 기본값은 숨김
 
-        # SAM3 사용 불가할 시 UI 비활성화
-        if not self.has_sam3:
+        # SAM3 및 Unet++ 사용 불가할 시 대응
+        from PyQt6.QtGui import QStandardItemModel
+        model = self.combo_roi_mode.model()
+        if isinstance(model, QStandardItemModel):
+            if not self.has_sam3:
+                item = model.item(1)
+                if item:
+                    item.setEnabled(False)
+            if not self.has_unetpp:
+                item = model.item(2)
+                if item:
+                    item.setEnabled(False)
+
+        if not self.has_sam3 and not self.has_unetpp:
             self.combo_roi_mode.setEnabled(False)
-            self.combo_roi_mode.setToolTip("GPU 환경이 구축되지 않았거나 SAM3 패키지가 설치되지 않았습니다.")
+            self.combo_roi_mode.setToolTip("GPU 환경이 구축되지 않았거나 모델 패키지가 설치되지 않았습니다.")
 
         # 분석 시간
         time_layout = QHBoxLayout()
@@ -1164,7 +1888,7 @@ class MainWindow(QMainWindow):
         self.spin_bpm_min.setMinimumWidth(60)
         self.spin_bpm_max = QSpinBox()
         self.spin_bpm_max.setRange(30, 900)
-        self.spin_bpm_max.setValue(600)
+        self.spin_bpm_max.setValue(500)
         self.spin_bpm_max.setMinimumWidth(60)
         bpm_layout.addWidget(self.spin_bpm_min)
         bpm_layout.addWidget(QLabel("~"))
@@ -1214,6 +1938,26 @@ class MainWindow(QMainWindow):
         self.btn_graph_popup.setEnabled(False)
         self.btn_graph_popup.clicked.connect(self.open_graph_popup)
         center_layout.addWidget(self.btn_graph_popup)
+
+        # PPG 데이터 선택 (RAW IR / RAW RED / 보간 신호)
+        self.group_ppg_select = QGroupBox("PPG 데이터 선택")
+        ppg_sel_layout = QHBoxLayout()
+        self.radio_ppg_ir    = QRadioButton("Raw IR")
+        self.radio_ppg_red   = QRadioButton("Raw RED")
+        self.radio_ppg_recon = QRadioButton("보간 신호")
+        self.radio_ppg_ir.setChecked(True)
+        self.bg_ppg_type = QButtonGroup()
+        self.bg_ppg_type.addButton(self.radio_ppg_ir,    0)
+        self.bg_ppg_type.addButton(self.radio_ppg_red,   1)
+        self.bg_ppg_type.addButton(self.radio_ppg_recon, 2)
+        ppg_sel_layout.addWidget(self.radio_ppg_ir)
+        ppg_sel_layout.addWidget(self.radio_ppg_red)
+        ppg_sel_layout.addWidget(self.radio_ppg_recon)
+        self.group_ppg_select.setLayout(ppg_sel_layout)
+        self.group_ppg_select.setEnabled(False)
+        center_layout.addWidget(self.group_ppg_select)
+        self.bg_ppg_type.idToggled.connect(self._on_main_ppg_type_changed)
+        self._main_df_segments = None  # hr_segments.csv DataFrame 캐시
 
         # CSV 저장
         center_layout.addStretch()
@@ -1518,9 +2262,11 @@ class MainWindow(QMainWindow):
         self.btn_setup.setChecked(False)
         self.btn_setup.setText("설정 완료")
         
-        # SAM3 모드인지 확인하여 분석 시작 버튼 활성화 여부 조절
-        is_sam3 = (self.combo_roi_mode.currentIndex() == 1)
-        self.btn_analyze.setEnabled(is_sam3)
+        # SAM3 또는 Unet++ 모드인지 확인하여 분석 시작 버튼 활성화 여부 조절
+        is_auto_seg = (self.combo_roi_mode.currentIndex() in (1, 2))
+        self.btn_analyze.setEnabled(is_auto_seg)
+        if is_auto_seg:
+            self.update_auto_seg_bg_roi()
         
         self.btn_analyze.setText("분석 시작")
         self.progress_bar.setValue(0)
@@ -1533,20 +2279,57 @@ class MainWindow(QMainWindow):
             p.clear()
 
     # -----------------------------------------------------------------
-    # SAM3 세그먼테이션 지원 메서드
+    # SAM3 및 Unet++ 세그먼테이션 지원 메서드
     # -----------------------------------------------------------------
-    def on_roi_mode_changed(self, index):
-        is_sam3 = (index == 1)
-        self.widget_manual_settings.setVisible(not is_sam3)
-        self.widget_sam3_settings.setVisible(is_sam3)
+    def update_auto_seg_bg_roi(self):
+        is_auto_seg = (self.combo_roi_mode.currentIndex() in (1, 2))
+        has_bg = self.spin_sam_bg_count.value() > 0 if is_auto_seg else False
         
-        if is_sam3:
+        if is_auto_seg and has_bg:
+            if self.bg_roi_item is None:
+                x_start, y_start = 100, 100
+                default_size = 100
+                if self.saved_bg_state:
+                    x, y, w, h = self.saved_bg_state
+                else:
+                    x, y, w, h = x_start, y_start, default_size, default_size
+                
+                self.bg_roi_item = pg.RectROI([x, y], [w, h], pen=pg.mkPen('m', width=3))
+                text_bg = pg.TextItem(f"Background\n({int(w)}x{int(h)})", color='m', anchor=(0, 1))
+                text_bg.setParentItem(self.bg_roi_item)
+                self.bg_roi_item.sigRegionChanged.connect(lambda r, t=text_bg: t.setText(f"Background\n({int(r.size()[0])}x{int(r.size()[1])})"))
+                self.image_view.addItem(self.bg_roi_item)
+        else:
+            if self.bg_roi_item is not None:
+                pos = self.bg_roi_item.pos()
+                size = self.bg_roi_item.size()
+                self.saved_bg_state = (pos[0], pos[1], size[0], size[1])
+                self.image_view.removeItem(self.bg_roi_item)
+                self.bg_roi_item = None
+
+    def on_roi_mode_changed(self, index):
+        is_auto_seg = (index == 1 or index == 2)
+        self.widget_manual_settings.setVisible(not is_auto_seg)
+        self.widget_sam3_settings.setVisible(is_auto_seg)
+        
+        if is_auto_seg:
             # 수동 ROI 박스 제거
             self.remove_roi_boxes()
             self.btn_setup.setChecked(False)
             self.btn_setup.setText("설정 완료")
             self.btn_analyze.setEnabled(True)
+            # SAM3 모드(index 1)에서만 임계값 표시
+            self.widget_sam_conf.setVisible(index == 1)
+            # 세그먼테이션 모드용 배경 ROI 업데이트
+            self.update_auto_seg_bg_roi()
         else:
+            # 자동 세그먼테이션 모드용 배경 ROI 제거
+            if self.bg_roi_item is not None:
+                pos = self.bg_roi_item.pos()
+                size = self.bg_roi_item.size()
+                self.saved_bg_state = (pos[0], pos[1], size[0], size[1])
+                self.image_view.removeItem(self.bg_roi_item)
+                self.bg_roi_item = None
             self.btn_analyze.setEnabled(self.btn_setup.isChecked())
 
     def get_sam3_processor(self):
@@ -1557,16 +2340,72 @@ class MainWindow(QMainWindow):
             import torch
             self.autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
             
-            self.sam3_model = sam3_model_builder(
-                device="cuda",
-                eval_mode=True,
-                load_from_HF=True,
-            )
-            self.sam3_processor = Sam3Processor(self.sam3_model, device="cuda", confidence_threshold=0.3)
-            self.lbl_status.setText("SAM3 로드 완료")
+            try:
+                self.sam3_model = sam3_model_builder(
+                    device="cuda",
+                    eval_mode=True,
+                    load_from_HF=True,
+                )
+                self.sam3_processor = Sam3Processor(self.sam3_model, device="cuda", confidence_threshold=0.3)
+                self.lbl_status.setText("SAM3 로드 완료")
+            except Exception as e:
+                err_msg = str(e)
+                # 허깅페이스 토큰/인증/권한 에러 감지
+                is_hf_auth_error = any(keyword in err_msg.lower() for keyword in ["401", "403", "gated", "token", "unauthorized", "login", "credential"])
+                if is_hf_auth_error:
+                    msg = (
+                        "허깅페이스(Hugging Face) 인증 에러가 발생했습니다.\n\n"
+                        "SAM3 모델을 처음 사용하려면 다음 단계를 완료해야 합니다:\n"
+                        "1. 웹 브라우저에서 아래 페이지에 로그인하여 모델 이용 약관에 동의하세요:\n"
+                        "   https://huggingface.co/facebook/sam3\n"
+                        "2. 터미널(가상환경)에서 'huggingface-cli login'을 실행해 액세스 토큰으로 로그인하거나,\n"
+                        "   환경 변수 HF_TOKEN에 토큰을 설정하세요.\n\n"
+                        "이 문제가 해결되기 전까지는 'ROI 직접설정' 또는 'Unet++ 세그먼테이션' 모드를 사용해 주세요."
+                    )
+                    QMessageBox.warning(self, "허깅페이스 인증 필요", msg)
+                    self.lbl_status.setText("SAM3 로드 실패 (인증 필요)")
+                    raise HFAuthError("허깅페이스 인증 필요")
+                else:
+                    raise e
         return self.sam3_processor
 
-    def run_sam3_preview(self):
+    def get_unetpp_model(self):
+        if self.unetpp_model is None:
+            self.lbl_status.setText("Unet++ 모델 로딩 중...")
+            QApplication.processEvents()
+            
+            import torch
+            import albumentations as A
+            from albumentations.pytorch import ToTensorV2
+            import segmentation_models_pytorch as smp
+            
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            # 1. 모델 아키텍처 빌드
+            self.unetpp_model = smp.UnetPlusPlus(
+                encoder_name="efficientnet-b3",
+                encoder_weights=None,
+                in_channels=3,
+                classes=3,
+            )
+            
+            # 2. 모델 가중치 로드
+            model_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "modules", "unetpp", "best_unetpp_an_ft_202606081136.pth"
+            )
+            self.unetpp_model.load_state_dict(torch.load(model_path, map_location=device))
+            self.unetpp_model.to(device).eval()
+            
+            # 3. 전처리 transform 정의
+            self.unetpp_transform = A.Compose([
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ])
+            self.lbl_status.setText("Unet++ 로드 완료")
+        return self.unetpp_model, self.unetpp_transform
+
+    def run_segmentation_preview(self):
         if not self.folder_path:
             QMessageBox.warning(self, "경고", "먼저 폴더를 선택하세요.")
             return
@@ -1579,7 +2418,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "경고", f"프레임 {f_idx} 파일을 찾을 수 없습니다.")
                 return
 
-        self.lbl_status.setText("SAM3 세그먼테이션 추론 중...")
+        current_mode = self.combo_roi_mode.currentIndex() # 1: SAM3, 2: Unet++
+        
+        if current_mode == 1:
+            self.lbl_status.setText("SAM3 세그먼테이션 추론 중...")
+        elif current_mode == 2:
+            self.lbl_status.setText("Unet++ 세그먼테이션 추론 중...")
         QApplication.processEvents()
 
         # 이미지 읽기 (BayerRG12 버그 수정 반영: cv2.COLOR_BayerBG2RGB)
@@ -1593,30 +2437,90 @@ class MainWindow(QMainWindow):
             img_rgb = (img_rgb / 16.0).clip(0, 255).astype(np.uint8)
 
         try:
-            processor = self.get_sam3_processor()
-            if processor is None:
-                raise Exception("SAM3 모델 로드 실패 (CUDA 장치 또는 Hugging Face 상태 확인 필요)")
-
-            conf_val = self.spin_sam_conf.value()
-            min_area_val = self.spin_sam_min_area.value()
-            processor.confidence_threshold = conf_val
-
-            from PIL import Image
-            pil_image = Image.fromarray(img_rgb)
-
-            # state 초기화 및 인코딩
-            with self.autocast_ctx:
-                state = processor.set_image(pil_image)
-
-            # tail
             tail_mask = None
-            if self.chk_sam_tail.isChecked():
+            foot1_mask = None
+            foot2_mask = None
+            min_area_val = self.spin_sam_min_area.value()
+
+            if current_mode == 1:
+                processor = self.get_sam3_processor()
+                if processor is None:
+                    raise Exception("SAM3 모델 로드 실패 (CUDA 장치 또는 Hugging Face 상태 확인 필요)")
+
+                conf_val = self.spin_sam_conf.value()
+                processor.confidence_threshold = conf_val
+
+                from PIL import Image
+                pil_image = Image.fromarray(img_rgb)
+
+                # state 초기화 및 인코딩
                 with self.autocast_ctx:
-                    state = processor.set_text_prompt(prompt="tail", state=state)
-                masks = state.get("masks")
-                if masks is not None and masks.shape[0] > 0:
-                    combined_mask = np.any(masks.cpu().numpy(), axis=0)[0].astype(np.uint8)
-                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(combined_mask)
+                    state = processor.set_image(pil_image)
+
+                # tail
+                if self.chk_sam_tail.isChecked():
+                    with self.autocast_ctx:
+                        state = processor.set_text_prompt(prompt="tail", state=state)
+                    masks = state.get("masks")
+                    if masks is not None and masks.shape[0] > 0:
+                        combined_mask = np.any(masks.cpu().numpy(), axis=0)[0].astype(np.uint8)
+                        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(combined_mask)
+                        valid_blobs = []
+                        for i in range(1, num_labels):
+                            area = stats[i, cv2.CC_STAT_AREA]
+                            if area >= min_area_val:
+                                valid_blobs.append((i, area))
+                        if valid_blobs:
+                            valid_blobs.sort(key=lambda x: x[1], reverse=True)
+                            best_label = valid_blobs[0][0]
+                            tail_mask = (labels == best_label).astype(np.uint8)
+
+                processor.reset_all_prompts(state)
+                with self.autocast_ctx:
+                    state = processor.set_image(pil_image)
+
+                # foot (최대 2개)
+                if self.chk_sam_foot1.isChecked() or self.chk_sam_foot2.isChecked():
+                    with self.autocast_ctx:
+                        state = processor.set_text_prompt(prompt="foot", state=state)
+                    masks = state.get("masks")
+                    if masks is not None and masks.shape[0] > 0:
+                        combined_mask = np.any(masks.cpu().numpy(), axis=0)[0].astype(np.uint8)
+                        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(combined_mask)
+                        valid_blobs = []
+                        for i in range(1, num_labels):
+                            area = stats[i, cv2.CC_STAT_AREA]
+                            if area >= min_area_val:
+                                cx = centroids[i][0]
+                                valid_blobs.append((i, area, cx))
+                        if valid_blobs:
+                            valid_blobs.sort(key=lambda x: x[1], reverse=True)
+                            top_blobs = valid_blobs[:2]
+                            if len(top_blobs) == 2:
+                                top_blobs.sort(key=lambda x: x[2])
+                                foot1_mask = (labels == top_blobs[0][0]).astype(np.uint8)
+                                foot2_mask = (labels == top_blobs[1][0]).astype(np.uint8)
+                            else:
+                                foot1_mask = (labels == top_blobs[0][0]).astype(np.uint8)
+            elif current_mode == 2:
+                model, transform = self.get_unetpp_model()
+                if model is None:
+                    raise Exception("Unet++ 모델 로드 실패")
+
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                
+                # Albumentations transform 및 tensor 변환
+                tensor = transform(image=img_rgb)["image"].unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    pred = model(tensor) # (1, C, H, W)
+                    pred_mask = torch.argmax(pred, dim=1).squeeze(0).cpu().numpy() # (H, W)
+
+                # tail (class 2)
+                if self.chk_sam_tail.isChecked():
+                    tail_raw_mask = (pred_mask == 2).astype(np.uint8)
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(tail_raw_mask)
                     valid_blobs = []
                     for i in range(1, num_labels):
                         area = stats[i, cv2.CC_STAT_AREA]
@@ -1627,20 +2531,10 @@ class MainWindow(QMainWindow):
                         best_label = valid_blobs[0][0]
                         tail_mask = (labels == best_label).astype(np.uint8)
 
-            processor.reset_all_prompts(state)
-            with self.autocast_ctx:
-                state = processor.set_image(pil_image)
-
-            # foot (최대 2개)
-            foot1_mask = None
-            foot2_mask = None
-            if self.chk_sam_foot1.isChecked() or self.chk_sam_foot2.isChecked():
-                with self.autocast_ctx:
-                    state = processor.set_text_prompt(prompt="foot", state=state)
-                masks = state.get("masks")
-                if masks is not None and masks.shape[0] > 0:
-                    combined_mask = np.any(masks.cpu().numpy(), axis=0)[0].astype(np.uint8)
-                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(combined_mask)
+                # foot (class 1)
+                if self.chk_sam_foot1.isChecked() or self.chk_sam_foot2.isChecked():
+                    foot_raw_mask = (pred_mask == 1).astype(np.uint8)
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(foot_raw_mask)
                     valid_blobs = []
                     for i in range(1, num_labels):
                         area = stats[i, cv2.CC_STAT_AREA]
@@ -1693,8 +2587,13 @@ class MainWindow(QMainWindow):
             levels = (0, 255) if preview_rgb.dtype == np.uint8 else (0, 4095)
             self.image_view.setImage(img_pg, autoRange=False, autoLevels=False, levels=levels)
 
-            self.lbl_status.setText("세그먼테이션 미리보기 완료")
+            if current_mode == 1:
+                self.lbl_status.setText("SAM3 세그먼테이션 미리보기 완료")
+            else:
+                self.lbl_status.setText("Unet++ 세그먼테이션 미리보기 완료")
 
+        except HFAuthError:
+            pass
         except Exception as e:
             QMessageBox.critical(self, "오류", f"세그먼테이션 중 오류 발생:\n{str(e)}")
             self.lbl_status.setText("세그먼테이션 오류")
@@ -1725,8 +2624,46 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "경고", "분석할 SAM3 ROI 영역을 적어도 하나 이상 체크하세요.")
                 return
 
+            if self.bg_roi_item:
+                pos = self.bg_roi_item.pos()
+                size = self.bg_roi_item.size()
+                bg_roi_info = (pos[0], pos[1], size[0], size[1])
+
             # 분석 전에 SAM3 모델 로드 보장
-            self.get_sam3_processor()
+            try:
+                self.get_sam3_processor()
+            except HFAuthError:
+                return
+            except Exception as e:
+                QMessageBox.critical(self, "오류", f"SAM3 모델 로드 중 오류 발생:\n{str(e)}")
+                self.lbl_status.setText("SAM3 로드 실패")
+                return
+        elif self.combo_roi_mode.currentIndex() == 2:
+            # Unet++ 세그먼테이션 모드
+            roi_mode = "unetpp"
+            if self.chk_sam_tail.isChecked():
+                active_sam3_rois.append('tail')
+            if self.chk_sam_foot1.isChecked():
+                active_sam3_rois.append('foot1')
+            if self.chk_sam_foot2.isChecked():
+                active_sam3_rois.append('foot2')
+
+            if not active_sam3_rois:
+                QMessageBox.warning(self, "경고", "분석할 Unet++ ROI 영역을 적어도 하나 이상 체크하세요.")
+                return
+
+            if self.bg_roi_item:
+                pos = self.bg_roi_item.pos()
+                size = self.bg_roi_item.size()
+                bg_roi_info = (pos[0], pos[1], size[0], size[1])
+
+            # 분석 전에 Unet++ 모델 로드 보장
+            try:
+                self.get_unetpp_model()
+            except Exception as e:
+                QMessageBox.critical(self, "오류", f"Unet++ 모델 로드 중 오류 발생:\n{str(e)}")
+                self.lbl_status.setText("Unet++ 로드 실패")
+                return
         else:
             # 수동 ROI 직접설정 모드
             roi_mode = "manual"
@@ -1757,7 +2694,9 @@ class MainWindow(QMainWindow):
             roi_mode=roi_mode, sam3_model=self.sam3_model,
             active_sam3_rois=active_sam3_rois,
             sam_conf=self.spin_sam_conf.value(),
-            sam_min_area=self.spin_sam_min_area.value()
+            sam_min_area=self.spin_sam_min_area.value(),
+            unetpp_model=self.unetpp_model,
+            unetpp_transform=self.unetpp_transform
         )
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.finished_signal.connect(self.analysis_finished)
@@ -1778,6 +2717,38 @@ class MainWindow(QMainWindow):
         self.btn_save_csv.setEnabled(True)
         self.btn_graph_popup.setEnabled(True)
         self.lbl_status.setText("분석 완료")
+
+        # PPG 선택 UI 활성화 및 hr_segments.csv / 채널 초기화
+        has_ir  = len(result.get('y_sensor_ir', [])) > 0
+        has_red = len(result.get('y_sensor_red', [])) > 0
+        hr_seg_path = os.path.join(self.folder_path, "hr_segments.csv")
+        has_seg = os.path.exists(hr_seg_path)
+        if has_ir or has_red:
+            self.group_ppg_select.setEnabled(True)
+            self.radio_ppg_ir.setVisible(has_ir)
+            self.radio_ppg_red.setVisible(has_red)
+            self.radio_ppg_recon.setVisible(has_seg)
+            if has_seg:
+                try:
+                    self._main_df_segments = pd.read_csv(hr_seg_path)
+                    if 'channel' in self._main_df_segments.columns:
+                        ch = str(self._main_df_segments['channel'].iloc[0]).upper()
+                        if "RED" in ch and has_red:
+                            self.radio_ppg_red.setChecked(True)
+                        elif has_ir:
+                            self.radio_ppg_ir.setChecked(True)
+                except Exception as e:
+                    print(f"[PPG] hr_segments.csv load error: {e}")
+                    self._main_df_segments = None
+            else:
+                self._main_df_segments = None
+                if has_ir:
+                    self.radio_ppg_ir.setChecked(True)
+                elif has_red:
+                    self.radio_ppg_red.setChecked(True)
+        else:
+            self.group_ppg_select.setEnabled(False)
+            self._main_df_segments = None
 
         # 경고 문구가 있으면 QMessageBox로 요약하여 안내
         warnings = result.get('warning_messages', [])
@@ -1847,6 +2818,10 @@ class MainWindow(QMainWindow):
         if checked and self.analysis_result:
             self.update_graphs()
 
+    def _on_main_ppg_type_changed(self, btn_id, checked):
+        if checked and self.analysis_result:
+            self.update_graphs()
+
     def update_graphs(self):
         if not self.analysis_result: return
 
@@ -1871,6 +2846,16 @@ class MainWindow(QMainWindow):
         roi_names = res.get('roi_names', [f"ROI {x+1}" for x in range(roi_count)])
 
         plot_colors = [(255,0,0), (0,255,0), (0,0,255)]
+
+        # 현재 X축 범위 저장 (채널 전환 시 뷰 유지)
+        _saved_x_range = None
+        for _p in self.plots:
+            try:
+                if _p.plotItem.scene() is not None:
+                    _saved_x_range = _p.viewRange()[0]
+                    break
+            except Exception:
+                pass
 
         # 기존 플롯들 초기화 및 레이아웃 정리
         self.graph_layout.clear()
@@ -1925,19 +2910,69 @@ class MainWindow(QMainWindow):
         p_filt.enableAutoRange()
         active_plots.append(p_filt)
 
-        # 5: PPG Raw Data
+        # 5: PPG Data (Raw IR / Raw RED / 보간 신호)
         if has_sensor:
             p_ppg = self.plots[4]
             p_ppg.clear()
+            for item in list(p_ppg.items):
+                if isinstance(item, pg.LinearRegionItem):
+                    p_ppg.removeItem(item)
             self.graph_layout.addItem(p_ppg)
             self.graph_layout.nextRow()
             t_sensor = res['t_sensor']
-            y_sensor = res['y_sensor']
             t_sensor_plot = t_sensor - t_cam[0] if len(t_sensor) > 0 else t_sensor
-            p_ppg.plot(t_sensor_plot, y_sensor, pen=pg.mkPen(200,200,200, width=2))
-            p_ppg.setTitle("PPG Raw Sensor Data")
-            p_ppg.enableAutoRange()
-            active_plots.append(p_ppg)
+            fs_sensor = (1.0 / np.mean(np.diff(t_sensor)) if len(t_sensor) > 1 else 60.0)
+
+            ppg_type = self.bg_ppg_type.checkedId()
+
+            if ppg_type == 1:  # Raw RED
+                y_data = res.get('y_sensor_red', [])
+                p_ppg.plot(t_sensor_plot, y_data, pen=pg.mkPen((255, 100, 100), width=2))
+                p_ppg.setTitle("PPG Raw Sensor Data (RED)")
+                p_ppg.enableAutoRange()
+                active_plots.append(p_ppg)
+            elif ppg_type == 2 and self._main_df_segments is not None:  # 보간 신호
+                chan = "IR"
+                if 'channel' in self._main_df_segments.columns:
+                    chan = str(self._main_df_segments['channel'].iloc[0]).upper()
+                y_raw = res.get('y_sensor_red', []) if "RED" in chan else res.get('y_sensor_ir', res.get('y_sensor', []))
+                if len(y_raw) > 0:
+                    sig_rp, sig_sp, filled, is_syn, valid_segs, gaps = reconstruct_ppg_signal(
+                        t_sensor, y_raw, fs_sensor,
+                        bpm_min / 60.0, bpm_max / 60.0,
+                        df_segments=self._main_df_segments,
+                        t0=res.get('t0', 0),
+                        t0_sensor=res.get('t0_sensor', 0)
+                    )
+                    p_ppg.plot(t_sensor_plot, sig_rp, pen=pg.mkPen('#1f77b4', width=2), connect='finite')
+                    p_ppg.plot(t_sensor_plot, sig_sp, pen=pg.mkPen('#ff7f0e', width=2, style=Qt.PenStyle.DashLine), connect='finite')
+                    p_ppg.setTitle(f"PPG Reconstructed Signal ({chan})")
+                    p_ppg.setYRange(-1.6, 1.6)
+                    active_plots.append(p_ppg)
+
+                    # 타임스탬프 오프셋
+                    t0_v      = res.get('t0', 0)
+                    t0_s_v    = res.get('t0_sensor', 0)
+                    dt_offset = t0_s_v - t0_v - (t_cam[0] if len(t_cam) > 0 else 0)
+
+                    # 라벨 영역: 초록
+                    for seg in valid_segs:
+                        s_pl = seg['label_start'] + dt_offset
+                        e_pl = seg['label_end']   + dt_offset
+                        p_ppg.addItem(pg.LinearRegionItem([s_pl, e_pl], movable=False,
+                                                          brush=pg.mkBrush(30, 180, 60, 40), pen=None))
+                    # 갭 영역: 빨강
+                    for gs, ge, *_ in gaps:
+                        s_pl = gs + dt_offset
+                        e_pl = ge + dt_offset
+                        p_ppg.addItem(pg.LinearRegionItem([s_pl, e_pl], movable=False,
+                                                          brush=pg.mkBrush(220, 30, 30, 45), pen=None))
+            else:  # Raw IR (default)
+                y_data = res.get('y_sensor_ir', res.get('y_sensor', []))
+                p_ppg.plot(t_sensor_plot, y_data, pen=pg.mkPen(200, 200, 200, width=2))
+                p_ppg.setTitle("PPG Raw Sensor Data (IR)")
+                p_ppg.enableAutoRange()
+                active_plots.append(p_ppg)
 
         # 6: Background Raw
         if has_bg:
@@ -1957,6 +2992,10 @@ class MainWindow(QMainWindow):
                 p.setXLink(active_plots[0])
             else:
                 p.setXLink(None)
+
+        # 저장된 X범위 복원 (채널 전환 시 등 재렌더링 후도 동일 범위 유지)
+        if _saved_x_range is not None and len(active_plots) > 0:
+            active_plots[0].setXRange(_saved_x_range[0], _saved_x_range[1], padding=0)
 
     # -----------------------------------------------------------------
     # CSV 저장
@@ -1996,7 +3035,7 @@ class MainWindow(QMainWindow):
         else:
             mapped_ppg = [np.nan] * len(t_cam)
 
-        fps = res['fs_cam']
+        fps = round(res['fs_cam'], 2)
 
         # ROI 이름 목록 가져오기
         roi_names = res.get('roi_names', [f"roi{x+1}" for x in range(roi_count)])

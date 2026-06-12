@@ -452,6 +452,9 @@ class SegmentLabelerApp(QMainWindow):
                 return
         # 시작시간 기준 정렬
         segs = sorted(self.segments, key=lambda x: x['start'])
+        self._write_csv_with_fallback(path, segs, save_ch)
+
+    def _write_csv_with_fallback(self, path, segs, save_ch):
         try:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 w = csv.writer(f)
@@ -466,9 +469,33 @@ class SegmentLabelerApp(QMainWindow):
                     ])
             self._unsaved = False
             self.lbl_status.setText(f"저장 완료: {path}")
+            QMessageBox.information(self, "저장 완료", f"성공적으로 저장되었습니다:\n{path}")
+        except PermissionError as e:
+            reply = QMessageBox.critical(
+                self, "저장 실패 (권한 에러)",
+                f"파일({os.path.basename(path)})을 쓸 수 없습니다.\n"
+                f"엑셀(Excel) 등 다른 프로그램에서 이 CSV 파일을 열어두고 있다면 닫아주세요.\n\n"
+                f"다른 이름으로 저장하시겠습니까?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply == QMessageBox.Yes:
+                self.save_as_dialog(segs, save_ch)
         except Exception as e:
-            QMessageBox.warning(self, "저장 실패", str(e))
-            QMessageBox.warning(self, "저장 실패", str(e))
+            reply = QMessageBox.critical(
+                self, "저장 실패",
+                f"저장 중 오류가 발생했습니다:\n{e}\n\n다른 이름으로 저장하시겠습니까?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply == QMessageBox.Yes:
+                self.save_as_dialog(segs, save_ch)
+
+    def save_as_dialog(self, segs, save_ch):
+        start_path = os.path.join(self.current_folder, "hr_segments_copy.csv")
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "다른 이름으로 저장", start_path, "CSV Files (*.csv);;All Files (*)"
+        )
+        if file_path:
+            self._write_csv_with_fallback(file_path, segs, save_ch)
 
     def reset_labels(self):
         if not self.current_folder:
@@ -545,10 +572,18 @@ class SegmentLabelerApp(QMainWindow):
         # 같은 seg를 가리키는 행 갱신
         idx = self.segments.index(seg)
         self._refresh_table_row(idx)
-        if self.selected_seg is seg:
-            self.spin_start.blockSignals(True); self.spin_end.blockSignals(True)
-            self.spin_start.setValue(seg['start']); self.spin_end.setValue(seg['end'])
-            self.spin_start.blockSignals(False); self.spin_end.blockSignals(False)
+        
+        # 드래그/조절 시 해당 구간을 선택 상태로 업데이트
+        if self.selected_seg is not seg:
+            self.table.blockSignals(True)
+            self.table.selectRow(idx)
+            self.table.blockSignals(False)
+            self.selected_seg = seg
+            self._highlight_active(seg)
+            
+        self.spin_start.blockSignals(True); self.spin_end.blockSignals(True)
+        self.spin_start.setValue(seg['start']); self.spin_end.setValue(seg['end'])
+        self.spin_start.blockSignals(False); self.spin_end.blockSignals(False)
 
     # ---------------- 테이블 ----------------
     def refresh_table(self):
@@ -615,7 +650,7 @@ class SegmentLabelerApp(QMainWindow):
         self.plot_widget.scene().sigMouseClicked.connect(self._on_plot_clicked)
 
     def _on_plot_clicked(self, ev):
-        if self.selected_seg is None or self.t_rel is None:
+        if self.t_rel is None:
             return
         # 좌클릭만, 더블클릭/우클릭 제외
         if ev.button() != Qt.LeftButton:
@@ -627,24 +662,49 @@ class SegmentLabelerApp(QMainWindow):
         pos = vb.mapSceneToView(ev.scenePos())
         x = float(pos.x())
         x = max(0.0, min(float(self.t_rel[-1]), x))
-        seg = self.selected_seg
-        # 가까운 경계로 스냅
-        if abs(x - seg['start']) <= abs(x - seg['end']):
-            new_start = min(x, seg['end'])
-            seg['start'] = new_start
-        else:
-            new_end = max(x, seg['start'])
-            seg['end'] = new_end
-        seg['region'].blockSignals(True)
-        seg['region'].setRegion([seg['start'], seg['end']])
-        seg['region'].blockSignals(False)
-        self._unsaved = True
-        # SpinBox 동기화
-        self.spin_start.blockSignals(True); self.spin_end.blockSignals(True)
-        self.spin_start.setValue(seg['start']); self.spin_end.setValue(seg['end'])
-        self.spin_start.blockSignals(False); self.spin_end.blockSignals(False)
-        idx = self.segments.index(seg)
-        self._refresh_table_row(idx)
+
+        # 1. 클릭한 위치가 이미 생성된 구간 내부인지 확인
+        clicked_seg = None
+        for seg in self.segments:
+            if seg['start'] <= x <= seg['end']:
+                clicked_seg = seg
+                break
+
+        if clicked_seg is not None:
+            # 해당 구간 선택
+            idx = self.segments.index(clicked_seg)
+            self.table.selectRow(idx)  # 테이블 선택 이벤트 호출 -> selected_seg 및 하이라이트 동기화
+            return
+
+        # 2. 어떤 구간 내부도 아니고, 선택된 구간이 있다면 가까운 경계 스냅
+        if self.selected_seg is not None:
+            seg = self.selected_seg
+            # 가까운 경계로 스냅
+            if abs(x - seg['start']) <= abs(x - seg['end']):
+                new_start = min(x, seg['end'])
+                seg['start'] = new_start
+            else:
+                new_end = max(x, seg['start'])
+                seg['end'] = new_end
+            seg['region'].blockSignals(True)
+            seg['region'].setRegion([seg['start'], seg['end']])
+            seg['region'].blockSignals(False)
+            self._unsaved = True
+            # SpinBox 동기화
+            self.spin_start.blockSignals(True); self.spin_end.blockSignals(True)
+            self.spin_start.setValue(seg['start']); self.spin_end.setValue(seg['end'])
+            self.spin_start.blockSignals(False); self.spin_end.blockSignals(False)
+            idx = self.segments.index(seg)
+            self._refresh_table_row(idx)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Delete:
+            # 텍스트 입력 창이나 스핀박스가 포커스를 잡고 있을 때는 Delete 키로 구간 삭제를 하지 않음
+            focused = QApplication.focusWidget()
+            if not isinstance(focused, (QLineEdit, QDoubleSpinBox)):
+                self.delete_segment()
+                return
+        super().keyPressEvent(event)
 
     # ---------------- 미리보기 (detrend + BPF + zscore) ----------------
     def preview_segment(self):
